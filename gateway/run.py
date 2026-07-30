@@ -14952,6 +14952,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 execute=_do_reset,
             )
 
+        if canonical == "clear":
+            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+                return self._telegram_topic_root_new_message()
+            async def _do_clear():
+                return await self._handle_clear_command(event)
+            return await self._maybe_confirm_destructive_slash(
+                event=event,
+                command="clear",
+                title="/clear",
+                detail=(
+                    "This starts a fresh session and discards the current "
+                    "conversation history. On Keybase, it also deletes the "
+                    "visible history for this chat only."
+                ),
+                execute=_do_clear,
+            )
+
         if canonical == "topic":
             return await self._handle_topic_command(event)
         
@@ -16145,6 +16162,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
         return source
+
+    async def _handle_clear_command(self, event: MessageEvent) -> str:
+        """Clear local Hermes state and, where supported, platform chat history."""
+        source = event.source
+        local_result = await self._handle_reset_command(event)
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return local_result
+
+        clear_fn = getattr(adapter, "clear_chat_history", None)
+        if not callable(clear_fn):
+            return local_result
+
+        try:
+            result = await clear_fn(
+                str(source.chat_id),
+                metadata=self._thread_metadata_for_source(source),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Platform chat history clear failed for %s/%s: %s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id,
+                exc,
+            )
+            return f"{local_result}\n\n⚠️ Local Hermes history was cleared, but platform chat history deletion failed: {exc}"
+
+        if result is not None and getattr(result, "success", False):
+            if source.platform == Platform.KEYBASE:
+                return f"{local_result}\n\n🧹 Keybase chat history cleared for this chat."
+            return f"{local_result}\n\n🧹 Platform chat history cleared for this chat."
+
+        error = getattr(result, "error", "not supported") if result is not None else "not supported"
+        if source.platform == Platform.KEYBASE:
+            return f"{local_result}\n\n⚠️ Local Hermes history was cleared, but Keybase chat history deletion failed: {error}"
+        return local_result
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""

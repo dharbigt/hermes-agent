@@ -3599,6 +3599,22 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    async def clear_chat_history(
+        self,
+        chat_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Clear the platform-visible chat history for ``chat_id``.
+
+        Optional and intentionally scoped to the current chat/conversation.
+        Gateway commands such as ``/clear`` use this after clearing Hermes'
+        local session state so adapters with a server-side history deletion API
+        can mirror the reset.  The default returns unsupported so non-Keybase
+        platforms keep their existing local-only behavior.
+        """
+        return SendResult(success=False, error="Not supported")
+
     def _get_ephemeral_system_ttl_default(self) -> int:
         """Read ``display.ephemeral_system_ttl`` from config.
 
