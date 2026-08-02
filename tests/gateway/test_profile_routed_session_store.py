@@ -14,11 +14,11 @@ from pathlib import Path
 import pytest
 
 # Ensure the test runs with an isolated HERMES_HOME so profile discovery
-# and get_active_profile_name() behave deterministically.
-import os
-_TMP = Path(__file__).parent.parent.parent / ".pytest_tmp_routed"
-_TMP.mkdir(parents=True, exist_ok=True)
-os.environ["HERMES_HOME"] = str(_TMP)
+# and get_active_profile_name() behave deterministically. Tests isolate
+# via tmp_path + monkeypatching hermes_cli.profiles (see each test), not by
+# writing a persistent temp dir into the repo root.
+import os  # noqa: E402
+import tempfile  # noqa: E402
 
 
 from gateway.session import (  # noqa: E402
@@ -48,7 +48,7 @@ def _temp_config():
     """Minimal config-like object with sessions_dir + multiplex_profiles."""
 
     class Cfg:
-        sessions_dir = _TMP / "global_sessions"
+        sessions_dir = Path(tempfile.mkdtemp(prefix="hermes_routed_test_"))
         multiplex_profiles = True
         write_sessions_json = True
         group_sessions_per_user = True
