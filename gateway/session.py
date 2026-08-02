@@ -1203,6 +1203,228 @@ class AsyncSessionStore:
         return _offloaded
 
 
+class ProfileRoutedSessionStore:
+    """Route session storage to a per-profile ``SessionStore``.
+
+    Under multiplexing, every served profile should *own* its session data on
+    disk — not merely carry an ``agent:<profile>:`` key prefix inside one shared
+    global ``sessions.json``. This wrapper keeps the original global store as the
+    backing for the ``default`` profile and lazily constructs one ``SessionStore``
+    per named profile pointed at ``<profile_dir>/sessions``.
+
+    Every public method resolves the target sub-store from its arguments:
+
+    * a ``SessionSource`` argument → ``source.profile``
+      (``SessionStore._resolve_profile_for_key``)
+    * a ``session_key`` string → the ``agent:<profile>:`` namespace
+      (``SessionStore._profile_from_session_key``)
+    * neither → the ``default`` store
+
+    Aggregating helpers (``has_any_sessions``, ``suspend_recently_active``,
+    ``prune_old_entries``, and the resume-pending enumeration used by the
+    auto-continue path) fan out across *all* sub-stores so gateway-wide
+    maintenance keeps working.
+
+    The async gateway facade (``AsyncSessionStore``) wraps a
+    ``ProfileRoutedSessionStore`` exactly as it would a plain ``SessionStore``,
+    because this class re-exposes the same synchronous method surface — the
+    offloading to a thread happens one level down, inside each sub-store's
+    ``AsyncSessionStore``.
+    """
+
+    def __init__(self, default_store: "SessionStore", config: "GatewayConfig",
+                 has_active_processes_fn=None):
+        self._default_store = default_store
+        self.config = config
+        self._has_active_processes_fn = has_active_processes_fn
+        # profile name -> SessionStore (default profile reuses default_store)
+        self._stores: Dict[str, "SessionStore"] = {"default": default_store}
+        self._stores_lock = threading.Lock()
+        self._migrated = False
+        # Profiles that exist on disk (and the active default) so we know which
+        # sub-store directories to create. Populated lazily on first need.
+        self._known_profiles: Optional[List[str]] = None
+
+    # -- profile resolution -------------------------------------------------
+
+    @staticmethod
+    def _arg_profile(source=None, session_key=None) -> str:
+        """Resolve which profile store should service a call."""
+        if isinstance(source, SessionSource):
+            from hermes_cli.profiles import get_active_profile_name
+            prof = getattr(source, "profile", None)
+            if prof:
+                return prof
+            return get_active_profile_name() or "default"
+        if isinstance(session_key, str) and session_key:
+            prof = SessionStore._profile_from_session_key(session_key)
+            return prof or "default"
+        return "default"
+
+    def _store_for(self, profile: str) -> "SessionStore":
+        """Return (creating if needed) the ``SessionStore`` for ``profile``."""
+        profile = profile or "default"
+        with self._stores_lock:
+            existing = self._stores.get(profile)
+            if existing is not None:
+                return existing
+            store = self._build_profile_store(profile)
+            self._stores[profile] = store
+            return store
+
+    def _build_profile_store(self, profile: str) -> "SessionStore":
+        """Construct a ``SessionStore`` rooted at the profile's sessions dir."""
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        if profile == "default" or not profile_exists(profile):
+            # default / unknown profile → fall back to the global store's dir
+            return self._default_store
+        sessions_dir = get_profile_dir(profile) / "sessions"
+        return SessionStore(
+            sessions_dir,
+            self.config,
+            has_active_processes_fn=self._has_active_processes_fn,
+        )
+
+    def _all_stores(self) -> List["SessionStore"]:
+        """All currently-known sub-stores, deduped, in creation order."""
+        with self._stores_lock:
+            seen = set()
+            out = []
+            for s in self._stores.values():
+                if id(s) not in seen:
+                    seen.add(id(s))
+                    out.append(s)
+            return out
+
+    def _resolve_target_store(self, *args, **kwargs) -> "SessionStore":
+        """Pick the sub-store for a method call from its positional/kwargs."""
+        source = kwargs.get("source")
+        if source is None:
+            for a in args:
+                if isinstance(a, SessionSource):
+                    source = a
+                    break
+        session_key = kwargs.get("session_key")
+        if session_key is None:
+            for a in args:
+                if isinstance(a, str) and a.startswith("agent:") or (
+                    isinstance(a, str) and ":" in a
+                ):
+                    # best-effort: only treat obvious session keys
+                    if a.startswith("agent:"):
+                        session_key = a
+                        break
+        profile = self._arg_profile(source=source, session_key=session_key)
+        return self._store_for(profile)
+
+    # -- migration ----------------------------------------------------------
+
+    def migrate_legacy_global_keys(self) -> int:
+        """Move ``agent:<profile>:`` rows out of the global store into their
+        profile dirs. One-shot and idempotent. Returns count migrated."""
+        if self._migrated:
+            return 0
+        self._migrated = True
+        moved = 0
+        global_store = self._default_store
+        with global_store._lock:
+            global_store._ensure_loaded_locked()
+            for key in list(global_store._entries.keys()):
+                prof = SessionStore._profile_from_session_key(key)
+                if not prof or prof == "default":
+                    continue
+                target = self._store_for(prof)
+                if target is global_store:
+                    continue
+                entry = global_store._entries.pop(key)
+                with target._lock:
+                    target._ensure_loaded_locked()
+                    target._entries[key] = entry
+                target._save()
+                moved += 1
+            if moved:
+                global_store._save()
+        return moved
+
+    # -- routing facade: delegate by arg shape ------------------------------
+
+    def __getattr__(self, name: str):
+        # Route to the appropriate sub-store. Most callers pass either a
+        # SessionSource or a session_key; resolve per call. Aggregating
+        # maintenance methods are handled explicitly below and never reach
+        # here.
+        def _route(*args, **kwargs):
+            target = self._resolve_target_store(*args, **kwargs)
+            return getattr(target, name)(*args, **kwargs)
+        return _route
+
+    # -- explicit aggregating maintenance (fan out across all stores) -------
+
+    def has_any_sessions(self) -> bool:
+        return any(s.has_any_sessions() for s in self._all_stores())
+
+    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
+        return sum(
+            s.suspend_recently_active(max_age_seconds=max_age_seconds)
+            for s in self._all_stores()
+        )
+
+    def prune_old_entries(self, max_age_days: int) -> int:
+        return sum(s.prune_old_entries(max_age_days) for s in self._all_stores())
+
+    def _ensure_loaded(self) -> None:
+        for s in self._all_stores():
+            s._ensure_loaded()
+
+    def _save(self) -> None:
+        for s in self._all_stores():
+            s._save()
+
+    def _entries_snapshot(self) -> Dict[str, Any]:
+        """Union of all sub-store entries (for resume-pending enumeration)."""
+        out: Dict[str, Any] = {}
+        for s in self._all_stores():
+            with s._lock:
+                s._ensure_loaded_locked()
+                out.update(s._entries)
+        return out
+
+    def get_entry(self, session_key: str) -> Any:
+        """Look up a single entry across all profile stores by key."""
+        for s in self._all_stores():
+            with s._lock:
+                s._ensure_loaded_locked()
+                entry = s._entries.get(session_key)
+                if entry is not None:
+                    return entry
+        return None
+
+    def _generate_session_key(self, source: SessionSource) -> str:
+        profile = self._arg_profile(source=source)
+        return self._store_for(profile)._generate_session_key(source)
+
+
+class AsyncProfileRoutedSessionStore:
+    """Async offload boundary for :class:`ProfileRoutedSessionStore`.
+
+    Mirrors :class:`AsyncSessionStore` but routes each call through the routed
+    store (which itself picks the right per-profile sub-store).
+    """
+
+    def __init__(self, routed: "ProfileRoutedSessionStore") -> None:
+        self._routed = routed
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._routed, name)
+        if not callable(attr):
+            return attr
+
+        async def _offloaded(*args, **kwargs) -> Any:
+            return await asyncio.to_thread(attr, *args, **kwargs)
+
+        return _offloaded
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.

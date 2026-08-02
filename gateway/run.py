@@ -2231,6 +2231,8 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    AsyncProfileRoutedSessionStore,
+    ProfileRoutedSessionStore,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -5803,16 +5805,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _bg_max_age_seconds = (
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
-        self.session_store = SessionStore(
-            self.config.sessions_dir, self.config,
+        self.session_store = ProfileRoutedSessionStore(
+            SessionStore(
+                self.config.sessions_dir, self.config,
+                has_active_processes_fn=lambda key: process_registry.has_active_for_session(
+                    key, max_active_age=_bg_max_age_seconds,
+                ),
+            ),
+            self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
         )
+        # One-time migration: move any agent:<profile>: rows out of the legacy
+        # global sessions.json into each profile's own sessions dir.
+        try:
+            migrated = self.session_store.migrate_legacy_global_keys()
+            if migrated:
+                logger.info("Migrated %d profile-scoped sessions to per-profile stores", migrated)
+        except Exception as exc:  # never block startup on migration
+            logger.warning("Profile session migration skipped: %s", exc)
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
-        self._async_session_store = AsyncSessionStore(self.session_store)
+        self._async_session_store = AsyncProfileRoutedSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -9156,7 +9172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if getattr(self, "session_store", None) is not None:
                     await self.async_session_store._ensure_loaded()
-                    entry = self.session_store._entries.get(session_key)
+                    entry = self.session_store.get_entry(session_key)
                     source = getattr(entry, "origin", None) if entry else None
             except Exception as e:
                 logger.debug(
@@ -9626,7 +9642,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for session_key in stuck_keys:
             try:
-                entry = self.session_store._entries.get(session_key)
+                entry = self.session_store.get_entry(session_key)
                 if entry and not entry.suspended:
                     entry.suspended = True
                     suspended += 1
@@ -10354,16 +10370,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         window = _auto_continue_freshness_window()
         try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
-                ]
+            candidates = [
+                entry for entry in self.session_store._entries_snapshot().values()
+                if entry.resume_pending
+                and not entry.suspended
+                and entry.origin is not None
+                and entry.resume_reason in self._AUTO_RESUME_REASONS
+                and (platform is None or entry.origin.platform == platform)
+            ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
@@ -11821,7 +11835,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self.async_session_store._ensure_loaded()
                 # Collect expired sessions first, then log a single summary.
                 _expired_entries = []
-                for key, entry in list(self.session_store._entries.items()):
+                for key, entry in list(self.session_store._entries_snapshot().items()):
                     if entry.expiry_finalized:
                         continue
                     if not await self.async_session_store._is_session_expired(entry):
@@ -16144,8 +16158,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def async_session_store(self) -> AsyncSessionStore:
         """Return the single async facade for this runner's SessionStore."""
         facade = getattr(self, "_async_session_store", None)
-        if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store)
+        if facade is None or getattr(facade, "_routed", None) is not self.session_store:
+            facade = AsyncProfileRoutedSessionStore(self.session_store)
             self._async_session_store = facade
         return facade
 
@@ -21643,7 +21657,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_key:
             try:
                 self.session_store._ensure_loaded()
-                entry = self.session_store._entries.get(session_key)
+                entry = self.session_store.get_entry(session_key)
                 if entry and getattr(entry, "origin", None):
                     return entry.origin
             except Exception as exc:

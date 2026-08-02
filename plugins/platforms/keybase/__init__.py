@@ -25,17 +25,24 @@ Requires:
 """
 
 import asyncio
+import errno
+import fcntl
 import json
 import logging
 import os
+import pty
 import random
+import select
 import shutil
+import signal
+import termios
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
+from agent.secret_scope import get_secret  # multiplex-aware: reads the active profile's .env scope
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -59,6 +66,15 @@ LISTENER_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0
 HEALTH_CHECK_STALE_THRESHOLD = 120.0
 RPC_TIMEOUT = 30.0
+# Bounds the interactive `keybase chat delete-history` confirmation handshake.
+# The command reads "Hit Enter to confirm" from /dev/tty (not stdin), so we
+# must drive it over a pty; this caps how long we wait for that prompt + exit.
+DELETE_HISTORY_TIMEOUT = 20.0
+
+# Live adapter instance, set on connect() so the on_session_reset plugin hook
+# can reach it. Keybase allows at most one logged-in service per --home, so a
+# single instance per gateway is correct.
+_ACTIVE_INSTANCE: "Optional[KeybaseAdapter]" = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +144,7 @@ def _resolve_keybase_bin(explicit: Optional[str] = None) -> str:
     """
     candidates = [
         (explicit or "").strip(),
-        (os.getenv("KEYBASE_BIN") or "").strip(),
+        (get_secret("KEYBASE_BIN") or "").strip(),
         shutil.which("keybase") or "",
         "/opt/data/bin/keybase",
         "/usr/bin/keybase",
@@ -176,12 +192,23 @@ class KeybaseAdapter(BasePlatformAdapter):
         # KEYBASE_HOME (compose / profile .env) → keybase --home. Root-owned
         # /opt/data/keybase-home is unusable when the gateway drops to hermes;
         # prefer a writable path such as $HERMES_HOME/keybase-home.
-        self._keybase_home = (os.getenv("KEYBASE_HOME") or "").strip() or None
+        self._keybase_home = (get_secret("KEYBASE_HOME") or "").strip() or None
 
         # Team/channel allowlist, same shape as Signal's group allowlist:
         # unset -> team channels disabled; "*" -> all allowed; else explicit list.
-        team_allowed_str = os.getenv("KEYBASE_ALLOWED_TEAMS", "")
+        team_allowed_str = get_secret("KEYBASE_ALLOWED_TEAMS", "")
         self.team_allow_from = set(_parse_comma_list(team_allowed_str))
+
+        # Default conversation to clear on session reset when no explicit
+        # chat_id is supplied. From KEYBASE_HOME_CHANNEL (profile .env) or the
+        # adapter config's ``home_channel`` extra. Comma-separated list allowed
+        # (e.g. "dharbigt,kosima") to mirror `keybase chat delete-history`.
+        home_channel = (
+            get_secret("KEYBASE_HOME_CHANNEL")
+            or extra.get("home_channel")
+            or ""
+        ).strip()
+        self.home_channels: List[str] = _parse_comma_list(home_channel)
 
         # Background process/tasks
         self._keybase_service_proc: Optional[asyncio.subprocess.Process] = None
@@ -249,7 +276,16 @@ class KeybaseAdapter(BasePlatformAdapter):
 
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock('keybase-account', 'default', 'Keybase account'):
+            # Identity is the active profile, not a hardcoded 'default', so a
+            # per-profile Keybase instance (e.g. kosima) cannot collide with a
+            # keybase bound to a different profile under multiplexing.
+            _profile = "default"
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile = get_active_profile_name() or "default"
+            except Exception:
+                pass
+            if not self._acquire_platform_lock('keybase-account', _profile, 'Keybase account'):
                 return False
             lock_acquired = True
         except Exception as e:
@@ -259,8 +295,8 @@ class KeybaseAdapter(BasePlatformAdapter):
         # If KEYBASE_USERNAME + KEYBASE_PAPERKEY are in .env, start the service
         # and authenticate ephemerally on every container startup. No persistent
         # login file needed — the paper key is the only secret that must be kept.
-        kb_username = os.getenv("KEYBASE_USERNAME", "").strip()
-        kb_paperkey = os.getenv("KEYBASE_PAPERKEY", "").strip()
+        kb_username = get_secret("KEYBASE_USERNAME", "").strip()
+        kb_paperkey = get_secret("KEYBASE_PAPERKEY", "").strip()
         if kb_username and kb_paperkey:
             if not await self._ensure_service_running():
                 if lock_acquired:
@@ -326,6 +362,9 @@ class KeybaseAdapter(BasePlatformAdapter):
         self._listen_task = asyncio.create_task(self._listen_loop())
         self._health_monitor_task = asyncio.create_task(self._health_monitor())
 
+        global _ACTIVE_INSTANCE
+        _ACTIVE_INSTANCE = self
+
         logger.info("Keybase: connected as %s", _redact_username(self._self_username))
         return True
 
@@ -354,6 +393,11 @@ class KeybaseAdapter(BasePlatformAdapter):
         await self._terminate_listen_proc()
         await self._stop_keybase_service()
         self._release_platform_lock()
+
+        global _ACTIVE_INSTANCE
+        if _ACTIVE_INSTANCE is self:
+            _ACTIVE_INSTANCE = None
+
         logger.info("Keybase: disconnected")
 
     async def _terminate_listen_proc(self) -> None:
@@ -715,6 +759,233 @@ class KeybaseAdapter(BasePlatformAdapter):
                 logger.warning("Keybase: CLI call errored: %s: %s", args, e)
             return None
 
+    # ------------------------------------------------------------------
+    # Conversation history clearing (session reset / reload)
+    # ------------------------------------------------------------------
+
+    async def _resolve_targets(self, targets: List[str]) -> List[str]:
+        """Normalize clear-history targets to channel specs keybase accepts.
+
+        ``keybase chat delete-history`` takes a *channel spec* (e.g.
+        ``dharbigt,kosima``) or a bare username, NOT a 64-char conversation
+        id. ``KEYBASE_HOME_CHANNEL`` is a conversation id, so we resolve each
+        target through the non-interactive ``keybase chat api -m
+        {"method":"list"}`` call, mapping any conversation id to its channel
+        name. Targets that are already channel specs / usernames pass through.
+        """
+        resolved: List[str] = []
+        seen: set = set()
+        for t in targets:
+            t = (t or "").strip()
+            if not t:
+                continue
+            # Already a channel spec (contains a comma) or a bare username?
+            if "," in t or (len(t) <= 16 and not _looks_like_conv_id(t)):
+                if t not in seen:
+                    resolved.append(t)
+                    seen.add(t)
+                continue
+            # Looks like a conversation id -> look it up via the list API.
+            spec = await self._conv_id_to_channel(t)
+            if spec and spec not in seen:
+                resolved.append(spec)
+                seen.add(spec)
+            elif t not in seen:
+                # Fallback: pass through unchanged (let keybase report error).
+                resolved.append(t)
+                seen.add(t)
+        return resolved
+
+    @staticmethod
+    def _looks_like_conv_id(s: str) -> bool:
+        return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+    async def _conv_id_to_channel(self, conv_id: str) -> Optional[str]:
+        """Map a conversation id to its ``name`` channel spec via the API."""
+        try:
+            out = await self._run_cli(
+                ["chat", "api", "-m", '{"method":"list"}'],
+                log_failures=False,
+            )
+        except Exception:
+            return None
+        if not out:
+            return None
+        try:
+            data = json.loads(out)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        convs = (
+            data.get("result", {}).get("conversations")
+            or []
+        )
+        for c in convs:
+            if c.get("id") == conv_id:
+                ch = c.get("channel", {}).get("name")
+                if ch:
+                    return ch
+        return None
+
+    def _delete_history_sync(self, target: str) -> bool:
+        """Synchronously clear one conversation's history via pty.
+
+        ``keybase chat delete-history`` reads its "Hit Enter to confirm"
+        prompt from /dev/tty (not stdin), so it cannot be driven by a plain
+        subprocess with piped stdin — piping a newline fails with
+        ``open /dev/tty: no such device or address``. We allocate a pty and
+        answer the prompt there, which is exactly what an interactive shell
+        (or an expect script) would do.
+
+        Returns True on success, False on any failure (caller logs, never
+        raises — clearing history must not block a session reset).
+        """
+        cmd = [
+            self.keybase_bin,
+            *self._home_args(),
+            "chat", "delete-history", target,
+        ]
+        try:
+            master_fd, slave_fd = pty.openpty()
+        except OSError as e:
+            logger.warning("Keybase: clear_history pty open failed: %s", e)
+            return False
+
+        # Non-blocking master so we can both read the prompt and bound runtime.
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        try:
+            pid = os.fork()
+        except OSError as e:
+            logger.warning("Keybase: clear_history fork failed: %s", e)
+            os.close(master_fd)
+            os.close(slave_fd)
+            return False
+
+        if pid == 0:
+            # Child: connect the slave pty as our controlling terminal and
+            # exec keybase. `delete-history` reads its confirmation from
+            # /dev/tty, so the slave must be made the controlling terminal
+            # via TIOCSCTTY — without it, keybase fails with
+            # "open /dev/tty: no such device or address".
+            try:
+                os.setsid()
+                try:
+                    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 1)
+                except OSError:
+                    pass
+                os.close(master_fd)
+                os.dup2(slave_fd, 0)
+                os.dup2(slave_fd, 1)
+                os.dup2(slave_fd, 2)
+                if slave_fd > 2:
+                    os.close(slave_fd)
+                os.execv(self.keybase_bin, cmd)
+            except Exception:
+                os._exit(127)
+            os._exit(127)
+
+        # Parent: drive the confirmation handshake.
+        os.close(slave_fd)
+        sent_confirm = False
+        deadline = time.monotonic() + DELETE_HISTORY_TIMEOUT
+        try:
+            while True:
+                if pid and os.waitpid(pid, os.WNOHANG)[0] != 0:
+                    break
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "Keybase: clear_history timed out for %s", target
+                    )
+                    break
+                try:
+                    r, _, _ = select.select([master_fd], [], [], 0.25)
+                except (OSError, select.error):
+                    break
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except (BlockingIOError, OSError):
+                    continue
+                if not chunk:
+                    break
+                text = chunk.decode("utf-8", errors="replace")
+                # The prompt is "Hit Enter to confirm" (localized in some
+                # builds); send a single carriage return once.
+                if not sent_confirm and "confirm" in text.lower():
+                    try:
+                        os.write(master_fd, b"\r")
+                        sent_confirm = True
+                    except OSError as e:
+                        logger.warning(
+                            "Keybase: clear_history confirm write failed: %s", e
+                        )
+                        break
+        finally:
+            # Reap the child if still running; kill if it overran the deadline.
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+                if waited == 0:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                    try:
+                        os.waitpid(pid, 0)
+                    except OSError:
+                        pass
+            except ChildProcessError:
+                pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        return sent_confirm
+
+    async def clear_history(self, chat_id: Optional[str] = None) -> bool:
+        """Clear Keybase conversation history for a session reset/reload.
+
+        ``chat_id`` is the conversation where the reset was issued (the most
+        precise target). Falls back to ``home_channels`` (KEYBASE_HOME_CHANNEL
+        / config ``home_channel``) when not supplied.
+
+        Returns True if at least one target was cleared successfully.
+        """
+        targets: List[str] = []
+        if chat_id:
+            targets.append(chat_id)
+        targets.extend(self.home_channels)
+        if not targets:
+            logger.debug(
+                "Keybase: clear_history called but no target resolved "
+                "(chat_id=%r, home_channels empty)", chat_id
+            )
+            return False
+        # Normalize conversation ids -> channel specs keybase accepts.
+        resolved = await self._resolve_targets(targets)
+        if not resolved:
+            logger.warning(
+                "Keybase: clear_history resolved no usable targets from %r", targets
+            )
+            return False
+        loop = asyncio.get_event_loop()
+        ok = False
+        for tgt in resolved:
+            try:
+                result = await loop.run_in_executor(
+                    None, self._delete_history_sync, tgt
+                )
+            except Exception as e:
+                logger.warning("Keybase: clear_history error for %s: %s", tgt, e)
+                result = False
+            if result:
+                ok = True
+                logger.info("Keybase: cleared history for %s", tgt)
+            else:
+                logger.warning("Keybase: failed to clear history for %s", tgt)
+        return ok
+
     async def _chat_api(self, method: str, params: dict, *, log_failures: bool = True) -> Any:
         """Send a request through `keybase chat api -m '<json>'`."""
         payload = {"method": method, "params": {"options": params}}
@@ -932,6 +1203,46 @@ class KeybaseAdapter(BasePlatformAdapter):
         if chat_id.startswith("team:"):
             return {"name": chat_id[len("team:"):], "type": "group", "chat_id": chat_id}
         return {"name": chat_id, "type": "dm", "chat_id": chat_id}
+
+
+# ---------------------------------------------------------------------------
+# Session-reset hook: clear the Keybase conversation buffer on /reset / /new
+# ---------------------------------------------------------------------------
+
+def _on_keybase_session_reset(**kwargs: Any) -> None:
+    """Plugin hook fired by the gateway on session reset.
+
+    The gateway's ``on_session_reset`` hook does not carry the conversation
+    id, so we clear the adapter's configured home channels (KEYBASE_HOME_CHANNEL
+    / config ``home_channel``). Runs the pty-backed clear off the event loop so
+    it never blocks the reset; failures are logged and swallowed.
+    """
+    if kwargs.get("platform") != "keybase":
+        return
+    inst = _ACTIVE_INSTANCE
+    if inst is None:
+        logger.debug("Keybase on_session_reset: no active adapter instance")
+        return
+
+    async def _clear() -> None:
+        try:
+            await inst.clear_history(None)
+        except Exception as exc:  # never block the reset on a clear failure
+            logger.warning("Keybase on_session_reset clear_history failed: %s", exc)
+
+    try:
+        loop = asyncio.get_event_loop()
+        asyncio.ensure_future(_clear())
+    except RuntimeError:
+        logger.debug("Keybase on_session_reset: no running loop to schedule clear")
+
+
+def register(ctx) -> None:
+    """Plugin entry point — wire the session-reset hook into the gateway."""
+    try:
+        ctx.register_hook("on_session_reset", _on_keybase_session_reset)
+    except Exception as exc:
+        logger.warning("Keybase: failed to register on_session_reset hook: %s", exc)
 
 
 # ---------------------------------------------------------------------------
