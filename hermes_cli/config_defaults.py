@@ -86,6 +86,13 @@ DEFAULT_CONFIG = {
         # api_modes — fixes the Gemini/Claude "stops after stating intent" case),
         # false (never), or a list of model-name substrings to match.
         "intent_ack_continuation": "auto",
+        # Agent-initiated session reset: when true, the model is offered a
+        # `reset_session` tool it can call to start a fresh conversation
+        # (the agent-side equivalent of the user typing /reset). OFF by
+        # default — the agent cannot wipe a conversation unless the operator
+        # explicitly opts in. This is a behavioral toggle, not a secret, so it
+        # lives here in config.yaml rather than .env.
+        "allow_agent_session_reset": False,
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
         # after a stub instead of finishing the artifact, (2) fabricating

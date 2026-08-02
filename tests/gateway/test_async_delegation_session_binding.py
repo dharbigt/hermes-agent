@@ -14,6 +14,13 @@ import pytest
 
 import tools.async_delegation as ad
 
+from tests.gateway.test_session_model_reset import (  # noqa: F401
+    _make_event,
+    _make_runner,
+    _make_source,
+    build_session_key,
+)
+
 
 @pytest.fixture(autouse=True)
 def _reset_async_delegation():
@@ -209,11 +216,24 @@ class TestGatewayPinningFailsClosed:
 
 
 class TestResetHandlerInterruptsDelegations:
-    def test_reset_command_calls_interrupt_for_session(self):
-        """The /new handler must sever the old conversation's delegations."""
-        import inspect
+    @pytest.mark.asyncio
+    async def test_reset_command_calls_interrupt_for_session(self, monkeypatch):
+        """The reset path must sever the old conversation's delegations."""
         from gateway import slash_commands
+        from tools import async_delegation
 
-        src = inspect.getsource(slash_commands.GatewaySlashCommandsMixin._handle_reset_command)
-        assert "interrupt_for_session" in src
-        assert "session_reset" in src
+        captured = {}
+
+        def _spy(session_key=None, parent_session_id=None, reason=None):
+            captured["session_key"] = session_key
+            captured["parent_session_id"] = parent_session_id
+            captured["reason"] = reason
+
+        monkeypatch.setattr(async_delegation, "interrupt_for_session", _spy)
+
+        runner = _make_runner()
+        session_key = build_session_key(_make_source())
+        await runner._handle_reset_command(_make_event("/new"))
+
+        assert captured.get("session_key") == session_key
+        assert captured.get("reason") == "session_reset"

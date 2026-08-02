@@ -116,36 +116,24 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
-        """Handle /new or /reset command."""
-        source = event.source
-        
-        # Get existing session key
-        session_key = self._session_key_for_source(source)
+    async def _reset_session_by_key(
+        self, session_key: str, *, reason: str = "agent_session_reset", source=None
+    ):
+        """Core session teardown shared by /reset, /new, and the agent-callable
+        ``reset_session`` tool.
+
+        Invalidates the run generation, releases the running-agent slot, cleans
+        up the old agent's resources, clears conversation-scoped state,
+        interrupts in-flight delegations, rotates the session id via
+        ``SessionStore.reset_session``, then fires the lifecycle hooks
+        (session:end, session:reset, on_session_reset). Returns the new
+        SessionEntry (or None if rotation failed).
+        """
         self._invalidate_session_run_generation(session_key, reason="session_reset")
-        # Evict the running-agent slot now that the generation is bumped. The
-        # in-flight run's own guarded release (run_generation=old) will return
-        # False and leave its dead agent behind; clearing here keeps the slot
-        # from becoming a zombie that silently drops all later messages (#28686).
-        # Idempotent, so the run's finally calling it again is harmless.
         self._release_running_agent_state(session_key)
 
-        # Snapshot the old entry so on_session_finalize can report the
-        # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
 
-        # Close tool resources on the old agent (terminal sandboxes, browser
-        # daemons, background processes) before evicting from cache.
-        # Guard with getattr because test fixtures may skip __init__.
-        #
-        # _cleanup_agent_resources is synchronous and can block for a long time
-        # (agent.close() does subprocess teardown; shutdown_memory_provider()
-        # may do network IO). This handler runs ON the event loop when a
-        # Telegram/Discord/Slack confirm-button click resolves the slash-confirm
-        # (see _request_slash_confirm), so an inline call wedges the whole loop
-        # and the bot goes silent until restart (#35994). Offload it to a worker
-        # thread (via the contextvar-preserving executor helper) with a bounded
-        # timeout so the loop is never blocked.
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         if _cache_lock is not None:
             with _cache_lock:
@@ -177,10 +165,6 @@ class GatewaySlashCommandsMixin:
                     )
         self._evict_cached_agent(session_key)
 
-        # Conversation boundary: clear ALL conversation-scoped per-session
-        # state (model/reasoning overrides, one-turn restores, model notes,
-        # last-resolved cache, /queue overflow) + security state in one
-        # funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
         self._clear_conversation_scope(session_key, reason="session_reset")
 
         # The old conversation's in-flight async delegations end WITH it
@@ -216,17 +200,16 @@ class GatewaySlashCommandsMixin:
         # Reset the session
         new_entry = await self.async_session_store.reset_session(session_key)
 
-        # (Conversation-scoped overrides + security state were already
-        # cleared via _clear_conversation_scope above.)
-
         _old_sid = old_entry.session_id if old_entry else None
+        _platform = source.platform.value if source and getattr(source, "platform", None) else ""
+        _user_id = source.user_id if source else ""
 
         # Fire plugin on_session_finalize hook (session boundary)
         try:
             from hermes_cli.lifecycle import finalize_session
             finalize_session(
                 session_id=_old_sid,
-                platform=source.platform.value if source.platform else "",
+                platform=_platform,
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=new_entry.session_id if new_entry else None,
@@ -236,17 +219,43 @@ class GatewaySlashCommandsMixin:
 
         # Emit session:end hook (session is ending)
         await self.hooks.emit("session:end", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
+            "platform": _platform,
+            "user_id": _user_id,
             "session_key": session_key,
         })
 
         # Emit session:reset hook
         await self.hooks.emit("session:reset", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
+            "platform": _platform,
+            "user_id": _user_id,
             "session_key": session_key,
         })
+
+        # Fire plugin on_session_reset hook (new session guaranteed to exist)
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _new_sid = new_entry.session_id if new_entry else None
+            _invoke_hook(
+                "on_session_reset",
+                session_id=_new_sid,
+                platform=_platform,
+                reason="new_session",
+                old_session_id=_old_sid,
+                new_session_id=_new_sid,
+            )
+        except Exception:
+            pass
+
+        return new_entry
+
+    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        """Handle /new or /reset command."""
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        # Shared teardown (invalidation, resource cleanup, scope clear, session
+        # rotation, lifecycle hooks) lives in _reset_session_by_key so the
+        # agent-callable reset_session tool reuses the exact same path.
+        new_entry = await self._reset_session_by_key(session_key, reason="session_reset", source=source)
 
         # Resolve session config info to surface to the user, scoped to the
         # profile serving this source so a multiplexed /reset //new banner
@@ -298,21 +307,6 @@ class GatewaySlashCommandsMixin:
                 await asyncio.to_thread(self._record_telegram_topic_binding, source, new_entry)
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
-
-        # Fire plugin on_session_reset hook (new session guaranteed to exist)
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _new_sid = new_entry.session_id if new_entry else None
-            _invoke_hook(
-                "on_session_reset",
-                session_id=_new_sid,
-                platform=source.platform.value if source.platform else "",
-                reason="new_session",
-                old_session_id=_old_sid,
-                new_session_id=_new_sid,
-            )
-        except Exception:
-            pass
 
         # Append a random tip to the reset message
         try:
