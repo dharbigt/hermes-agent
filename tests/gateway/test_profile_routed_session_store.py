@@ -189,3 +189,50 @@ def test_get_entry_searches_all_stores(tmp_path):
     finally:
         hp.get_profile_dir = _orig_dir
         hp.profile_exists = _orig_exists
+
+
+def test_state_db_row_migrates_to_profile_db(tmp_path):
+    """The state.db mirror row + messages must move into the profile db, and
+    be removed from the global db, so the dashboard attributes it correctly."""
+    cfg = _temp_config()
+    profile_dir = tmp_path / "profiles" / "kosima"
+    (profile_dir / "sessions").mkdir(parents=True)
+    cfg.sessions_dir = tmp_path / "global"
+
+    global_store = SessionStore(cfg.sessions_dir, cfg)
+    key = _seed_global_store_with_profile_key(global_store, "kosima", "dbrow")
+    sid = global_store._entries[key].session_id
+    # Write a real session row + message into the global state.db.
+    from hermes_state import SessionDB
+    gdb = global_store._db
+    gdb.create_session(sid, "keybase", session_key=key)
+    gdb.replace_messages(sid, [
+        {"role": "user", "content": "hello from keybase"},
+        {"role": "assistant", "content": "hi there"},
+    ])
+
+    import hermes_cli.profiles as hp
+
+    _orig_dir = hp.get_profile_dir
+    _orig_exists = hp.profile_exists
+    hp.get_profile_dir = lambda n: tmp_path / "profiles" / n
+    hp.profile_exists = lambda n: (tmp_path / "profiles" / n).exists()
+    try:
+        routed = ProfileRoutedSessionStore(global_store, cfg)
+        moved = routed.migrate_legacy_global_keys()
+        assert moved >= 1
+        # Global db no longer has the row.
+        assert gdb.get_session(sid) is None
+        # Profile db has the row + messages.
+        kosima_store = routed._store_for("kosima")
+        kdb = kosima_store._db
+        row = kdb.get_session(sid)
+        assert row is not None
+        assert row.get("source") == "keybase"
+        msgs = kdb.get_messages(sid)
+        assert len(msgs) == 2
+        # Idempotent: a second migration moves nothing.
+        assert routed.migrate_legacy_global_keys() == 0
+    finally:
+        hp.get_profile_dir = _orig_dir
+        hp.profile_exists = _orig_exists

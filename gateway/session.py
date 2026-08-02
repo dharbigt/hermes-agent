@@ -1278,11 +1278,17 @@ class ProfileRoutedSessionStore:
         if profile == "default" or not profile_exists(profile):
             # default / unknown profile → fall back to the global store's dir
             return self._default_store
-        sessions_dir = get_profile_dir(profile) / "sessions"
+        profile_dir = get_profile_dir(profile)
+        sessions_dir = profile_dir / "sessions"
+        # Point the SQLite mirror at the profile's own state.db so the
+        # dashboard (which reads state.db per profile) attributes sessions
+        # to the correct profile instead of the global default store.
+        db_path = profile_dir / "state.db"
         return SessionStore(
             sessions_dir,
             self.config,
             has_active_processes_fn=self._has_active_processes_fn,
+            db_path=db_path,
         )
 
     def _all_stores(self) -> List["SessionStore"]:
@@ -1321,7 +1327,8 @@ class ProfileRoutedSessionStore:
 
     def migrate_legacy_global_keys(self) -> int:
         """Move ``agent:<profile>:`` rows out of the global store into their
-        profile dirs. One-shot and idempotent. Returns count migrated."""
+        profile dirs (both the sessions.json index and the state.db mirror).
+        One-shot and idempotent. Returns count migrated."""
         if self._migrated:
             return 0
         self._migrated = True
@@ -1341,10 +1348,125 @@ class ProfileRoutedSessionStore:
                     target._ensure_loaded_locked()
                     target._entries[key] = entry
                 target._save()
+                # Move the SQLite mirror row + messages so the dashboard
+                # (which reads state.db per profile) attributes the session to
+                # the correct profile instead of the global default store.
+                self._migrate_session_db_row(global_store, target, entry.session_id)
                 moved += 1
             if moved:
                 global_store._save()
+        # Also catch rows whose sessions.json index was already moved by an
+        # earlier build but whose state.db mirror still lives in the global db
+        # (e.g. after a prior pull that only migrated sessions.json). Scan the
+        # global state.db for any non-default agent:<profile>: session_key.
+        moved += self._migrate_orphan_state_db_rows(global_store)
         return moved
+
+    def _migrate_orphan_state_db_rows(self, global_store) -> int:
+        """Move state.db rows keyed ``agent:<profile>:`` (non-default) that are
+        no longer present in the sessions.json index, into the profile db."""
+        gdb = getattr(global_store, "_db", None)
+        if gdb is None:
+            return 0
+        import sqlite3 as _sqlite
+        gpath = getattr(gdb, "db_path", None)
+        if not gpath:
+            return 0
+        try:
+            gcon = _sqlite.connect(str(gpath), timeout=5.0)
+        except Exception as exc:
+            logger.warning("state.db orphan scan skipped: %s", exc)
+            return 0
+        moved = 0
+        try:
+            rows = gcon.execute(
+                "SELECT id, session_key FROM sessions "
+                "WHERE session_key LIKE 'agent:%' "
+                "AND session_key NOT LIKE 'agent:default:%'"
+            ).fetchall()
+            for session_id, session_key in rows:
+                prof = SessionStore._profile_from_session_key(session_key)
+                if not prof or prof == "default":
+                    continue
+                target = self._store_for(prof)
+                if target is global_store:
+                    continue
+                self._migrate_session_db_row(global_store, target, session_id)
+                moved += 1
+        finally:
+            gcon.close()
+        return moved
+
+    @staticmethod
+    def _migrate_session_db_row(global_store, target_store, session_id: str) -> None:
+        """Move a session's state.db row + messages from ``global_store``'s db
+        into ``target_store``'s db, then delete it from the global db.
+
+        Uses a faithful SQLite ATTACH copy (same schema in both files) so every
+        column, FTS trigger, and token-accounting row transfers verbatim. The
+        target's ``messages_fts`` is repopulated by the AFTER INSERT triggers
+        that fire on the bulk INSERT. No-op if either store lacks a _db or the
+        row is already absent.
+        """
+        gdb = getattr(global_store, "_db", None)
+        tdb = getattr(target_store, "_db", None)
+        if gdb is None or tdb is None or not session_id:
+            return
+        gpath = getattr(gdb, "db_path", None)
+        tpath = getattr(tdb, "db_path", None)
+        if not gpath or not tpath:
+            return
+        import sqlite3 as _sqlite
+        try:
+            gcon = _sqlite.connect(str(gpath), timeout=5.0)
+            tcon = _sqlite.connect(str(tpath), timeout=5.0)
+            try:
+                gcur = gcon.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+                )
+                if gcur.fetchone()[0] == 0:
+                    return
+                # Copy sessions row (dynamic columns — same schema both sides).
+                cols = [
+                    d[1] for d in gcon.execute("PRAGMA table_info(sessions)")
+                ]
+                col_list = ", ".join(cols)
+                qmarks = ", ".join("?" for _ in cols)
+                row = gcon.execute(
+                    f"SELECT {col_list} FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                tcon.execute(
+                    f"INSERT OR REPLACE INTO sessions ({col_list}) VALUES ({qmarks})",
+                    row,
+                )
+                # Copy messages rows (FTS triggers fire on INSERT).
+                mcols = [
+                    d[1] for d in gcon.execute("PRAGMA table_info(messages)")
+                ]
+                mcol_list = ", ".join(mcols)
+                mqmarks = ", ".join("?" for _ in mcols)
+                mrows = gcon.execute(
+                    f"SELECT {mcol_list} FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchall()
+                if mrows:
+                    tcon.executemany(
+                        f"INSERT OR REPLACE INTO messages ({mcol_list}) VALUES ({mqmarks})",
+                        mrows,
+                    )
+                tcon.commit()
+                # Remove the now-duplicated global row so it stops appearing
+                # under the default profile.
+                gcon.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+                gcon.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                gcon.commit()
+            finally:
+                gcon.close()
+                tcon.close()
+        except Exception as exc:
+            logger.warning(
+                "Failed to migrate state.db row %s: %s", session_id, exc
+            )
 
     # -- routing facade: delegate by arg shape ------------------------------
 
@@ -1434,7 +1556,7 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None, db_path: Path = None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1479,7 +1601,7 @@ class SessionStore:
         self._db = None
         try:
             from hermes_state import SessionDB
-            self._db = SessionDB()
+            self._db = SessionDB(db_path=db_path) if db_path else SessionDB()
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
