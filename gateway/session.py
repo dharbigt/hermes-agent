@@ -1328,10 +1328,7 @@ class ProfileRoutedSessionStore:
     def migrate_legacy_global_keys(self) -> int:
         """Move ``agent:<profile>:`` rows out of the global store into their
         profile dirs (both the sessions.json index and the state.db mirror).
-        One-shot and idempotent. Returns count migrated."""
-        if self._migrated:
-            return 0
-        self._migrated = True
+        Idempotent; safe to call every startup. Returns count migrated."""
         moved = 0
         global_store = self._default_store
         with global_store._lock:
@@ -1357,14 +1354,18 @@ class ProfileRoutedSessionStore:
                 global_store._save()
         # Also catch rows whose sessions.json index was already moved by an
         # earlier build but whose state.db mirror still lives in the global db
-        # (e.g. after a prior pull that only migrated sessions.json). Scan the
-        # global state.db for any non-default agent:<profile>: session_key.
+        # (e.g. after a prior pull that only migrated sessions.json), plus any
+        # row tagged with a non-default profile_name (the key may have been
+        # cleared during an earlier partial move). Scans the global state.db.
         moved += self._migrate_orphan_state_db_rows(global_store)
         return moved
 
     def _migrate_orphan_state_db_rows(self, global_store) -> int:
-        """Move state.db rows keyed ``agent:<profile>:`` (non-default) that are
-        no longer present in the sessions.json index, into the profile db."""
+        """Move state.db rows that belong to a named (non-default) profile but
+        still live in the global db, into that profile's db. Matches both an
+        ``agent:<profile>:`` session_key and a non-default ``profile_name``
+        column (the latter catches rows left with a NULL key by a prior partial
+        move)."""
         gdb = getattr(global_store, "_db", None)
         if gdb is None:
             return 0
@@ -1380,17 +1381,39 @@ class ProfileRoutedSessionStore:
         moved = 0
         try:
             rows = gcon.execute(
-                "SELECT id, session_key FROM sessions "
-                "WHERE session_key LIKE 'agent:%' "
-                "AND session_key NOT LIKE 'agent:default:%'"
+                "SELECT id, session_key, profile_name FROM sessions "
+                "WHERE (session_key LIKE 'agent:%' "
+                "       AND session_key NOT LIKE 'agent:default:%') "
+                "OR (profile_name IS NOT NULL AND profile_name != 'default')"
             ).fetchall()
-            for session_id, session_key in rows:
-                prof = SessionStore._profile_from_session_key(session_key)
+            seen = set()
+            for session_id, session_key, profile_name in rows:
+                if session_id in seen:
+                    continue
+                seen.add(session_id)
+                prof = (
+                    SessionStore._profile_from_session_key(session_key)
+                    if session_key
+                    else None
+                ) or (profile_name or "default")
                 if not prof or prof == "default":
                     continue
                 target = self._store_for(prof)
                 if target is global_store:
                     continue
+                # Skip if the row already exists in the target db (idempotent).
+                tdb = getattr(target, "_db", None)
+                if tdb is not None:
+                    try:
+                        if tdb.get_session(session_id) is not None:
+                            # Already migrated; just delete the stale global row.
+                            try:
+                                gdb.delete_session(session_id)
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
                 self._migrate_session_db_row(global_store, target, session_id)
                 moved += 1
         finally:
@@ -1456,10 +1479,18 @@ class ProfileRoutedSessionStore:
                     )
                 tcon.commit()
                 # Remove the now-duplicated global row so it stops appearing
-                # under the default profile.
-                gcon.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-                gcon.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-                gcon.commit()
+                # under the default profile. Use the gateway's OWN SessionDB
+                # connection (not a fresh sqlite handle) so the delete is
+                # WAL-consistent with the live writer and actually sticks —
+                # a separate connection's DELETE can be left behind by the
+                # gateway's own pending writes.
+                try:
+                    gdb.delete_session(session_id)
+                except Exception as _del_exc:
+                    logger.warning(
+                        "Could not delete migrated global row %s: %s",
+                        session_id, _del_exc,
+                    )
             finally:
                 gcon.close()
                 tcon.close()
@@ -1510,6 +1541,17 @@ class ProfileRoutedSessionStore:
                 s._ensure_loaded_locked()
                 out.update(s._entries)
         return out
+
+    @property
+    def _entries(self) -> Dict[str, Any]:
+        """Read-only union view of all sub-store entries.
+
+        Call sites that previously reached into the single shared store's
+        ``_entries`` dict (e.g. ``session_store._entries.get(key)``) keep
+        working against the routed store without hitting ``__getattr__``
+        (which would otherwise return a routing closure and break ``.get()``).
+        """
+        return self._entries_snapshot()
 
     def get_entry(self, session_key: str) -> Any:
         """Look up a single entry across all profile stores by key."""

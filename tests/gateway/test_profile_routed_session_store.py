@@ -236,3 +236,34 @@ def test_state_db_row_migrates_to_profile_db(tmp_path):
     finally:
         hp.get_profile_dir = _orig_dir
         hp.profile_exists = _orig_exists
+
+
+def test_routed_store_entries_attribute_is_dict_not_function(tmp_path):
+    """Regression: ``session_store._entries.get(key)`` must work on the routed
+    store (used by the /reset handler). __getattr__ must not return a routing
+    closure for the data attribute, which would raise
+    'function' object has no attribute 'get'."""
+    cfg = _temp_config()
+    profile_dir = tmp_path / "profiles" / "kosima"
+    (profile_dir / "sessions").mkdir(parents=True)
+    cfg.sessions_dir = tmp_path / "global"
+
+    global_store = SessionStore(cfg.sessions_dir, cfg)
+    key = _seed_global_store_with_profile_key(global_store, "kosima", "attr")
+    global_store._save()
+
+    import hermes_cli.profiles as hp
+
+    _orig_dir = hp.get_profile_dir
+    _orig_exists = hp.profile_exists
+    hp.get_profile_dir = lambda n: tmp_path / "profiles" / n
+    hp.profile_exists = lambda n: (tmp_path / "profiles" / n).exists()
+    try:
+        routed = ProfileRoutedSessionStore(global_store, cfg)
+        # This is exactly what the /reset handler does.
+        entries = routed._entries
+        assert isinstance(entries, dict)
+        assert entries.get(key) is not None
+    finally:
+        hp.get_profile_dir = _orig_dir
+        hp.profile_exists = _orig_exists
