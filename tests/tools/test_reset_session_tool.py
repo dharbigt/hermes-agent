@@ -21,14 +21,30 @@ def _fake_entry(session_id: str):
     return e
 
 
+def _write_profile_config(tmp_path, name: str, body: str):
+    """Create profiles/<name>/config.yaml under a fake hermes root."""
+    profile_home = tmp_path / "profiles" / name
+    profile_home.mkdir(parents=True)
+    cfg = profile_home / "config.yaml"
+    cfg.write_text(body, encoding="utf-8")
+    return profile_home, cfg
+
+
+def _point_profiles_at(monkeypatch, tmp_path):
+    """Make get_profile_dir resolve under tmp_path for both home layouts."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles"
+    )
+
+
 @pytest.mark.asyncio
-async def test_check_requirements_defaults_off(monkeypatch):
+async def test_check_requirements_defaults_off(monkeypatch, tmp_path):
     """The tool must NOT be available unless explicitly enabled for the profile."""
-
-    def _cfg_off():
-        return {"agent": {}}
-
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", _cfg_off)
+    _point_profiles_at(monkeypatch, tmp_path)
+    _write_profile_config(tmp_path, "kosima", "agent: {}\n")
     monkeypatch.setattr(
         "gateway.session_context.get_session_env",
         lambda name, default="": "kosima" if name == "HERMES_SESSION_PROFILE" else default,
@@ -37,11 +53,11 @@ async def test_check_requirements_defaults_off(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_check_requirements_enabled(monkeypatch):
-    def _cfg_on():
-        return {"agent": {"allow_agent_session_reset": True}}
-
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", _cfg_on)
+async def test_check_requirements_enabled(monkeypatch, tmp_path):
+    _point_profiles_at(monkeypatch, tmp_path)
+    _write_profile_config(
+        tmp_path, "kosima", "agent:\n  allow_agent_session_reset: true\n"
+    )
     monkeypatch.setattr(
         "gateway.session_context.get_session_env",
         lambda name, default="": "kosima" if name == "HERMES_SESSION_PROFILE" else default,
@@ -50,48 +66,62 @@ async def test_check_requirements_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_check_requirements_reads_profile_config_not_double_nested(monkeypatch):
-    """Regression: under multiplex the per-task HERMES_HOME override already
-    points at the profile home, so the named-profile read must resolve to the
-    profile's own config.yaml and NOT a double-nested
-    profiles/<name>/profiles/<name>/config.yaml.
+async def test_check_requirements_reads_profile_config_not_double_nested(
+    monkeypatch, tmp_path
+):
+    """Regression: path must come from get_profile_dir, never
+    get_hermes_home()/profiles/<name> (double-nests under the override).
     """
-    captured = {}
-
-    def _cfg_on():
-        return {"agent": {"allow_agent_session_reset": True}}
-
-    # read_raw_config() is profile-aware (no path arg): it reads get_config_path(),
-    # which under the override resolves to the profile home. Spy on the call to
-    # ensure it is invoked with no path (i.e. we rely on get_config_path, never
-    # construct a nested path ourselves).
-    def _spy_read_raw():
-        captured["called"] = True
-        return _cfg_on()
-
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", _spy_read_raw)
+    _point_profiles_at(monkeypatch, tmp_path)
+    profile_home, cfg = _write_profile_config(
+        tmp_path, "kosima", "agent:\n  allow_agent_session_reset: true\n"
+    )
+    # Simulate multiplex per-task override: HERMES_HOME already = profile home.
+    # A buggy get_hermes_home()/profiles/kosima path would miss the real file.
+    monkeypatch.setattr(
+        "hermes_constants.get_hermes_home", lambda: profile_home
+    )
     monkeypatch.setattr(
         "gateway.session_context.get_session_env",
         lambda name, default="": "kosima" if name == "HERMES_SESSION_PROFILE" else default,
     )
+    assert (profile_home / "profiles" / "kosima" / "config.yaml").exists() is False
+    assert cfg.is_file()
     assert reset_session_tool.check_requirements() is True
-    assert captured.get("called") is True
 
 
 @pytest.mark.asyncio
-async def test_check_requirements_default_profile_ignores_named_flag(monkeypatch):
-    """A flag set only on a named profile must not leak into the default profile.
-
-    The default profile reads load_config() (base config); a named profile
-    reads its own profile config via read_raw_config(). Scoping the gate by
-    profile means a kosima-only flag stays kosima-only.
+async def test_check_requirements_works_before_home_override(monkeypatch, tmp_path):
+    """Regression: parent/pre-scope layout — HERMES_HOME is the hermes root,
+    only HERMES_SESSION_PROFILE names the active profile. Bare read_raw_config()
+    would read the base config and miss a profile-only flag.
     """
-    # Base config (default profile) has NO flag; kosima profile config HAS it.
+    _point_profiles_at(monkeypatch, tmp_path)
+    _write_profile_config(
+        tmp_path, "kosima", "agent:\n  allow_agent_session_reset: true\n"
+    )
+    # Base config has NO flag.
+    (tmp_path / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "kosima" if name == "HERMES_SESSION_PROFILE" else default,
+    )
+    # If the gate wrongly read base config.yaml, this would be False.
+    assert reset_session_tool.check_requirements() is True
+
+
+@pytest.mark.asyncio
+async def test_check_requirements_default_profile_ignores_named_flag(
+    monkeypatch, tmp_path
+):
+    """A flag set only on a named profile must not leak into the default profile."""
+    _point_profiles_at(monkeypatch, tmp_path)
+    _write_profile_config(
+        tmp_path, "kosima", "agent:\n  allow_agent_session_reset: true\n"
+    )
+    # Base/default has no flag.
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"agent": {}})
-    monkeypatch.setattr(
-        "hermes_cli.config.read_raw_config",
-        lambda: {"agent": {"allow_agent_session_reset": True}},
-    )
 
     def _profile_ctx(profile: str):
         monkeypatch.setattr(

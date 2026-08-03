@@ -37,17 +37,32 @@ def _active_profile() -> Optional[str]:
 def _load_config_for_profile(profile: Optional[str]):
     """Load the config for ``profile`` (or the base config when None/'default').
 
-    Under multiplex the gateway sets a per-task HERMES_HOME override to the
-    active profile's home, so ``read_raw_config()`` (which resolves its path
-    via ``get_config_path()``) already reads that profile's own config.yaml —
-    no manual path construction needed (and none that could double-nest under
-    ``profiles/<name>/profiles/<name>``).
+    Named profiles are resolved via ``get_profile_dir(name)``, which is
+    anchored to the hermes *root* (not the current ``HERMES_HOME``). That
+    covers both multiplex layouts without double-nesting:
+
+    - parent / pre-scope: ``HERMES_HOME=/opt/data`` + session profile ``kosima``
+      → read ``/opt/data/profiles/kosima/config.yaml``
+    - per-task override: ``HERMES_HOME`` already ``/opt/data/profiles/kosima``
+      → still read that same profile path (never
+      ``.../profiles/kosima/profiles/kosima/config.yaml``)
+
+    Building the path from ``get_hermes_home() / "profiles" / name`` is wrong
+    under the override; calling bare ``read_raw_config()`` is wrong when the
+    override is *not* yet applied (it would read the base config and miss a
+    profile-only flag).
     """
     try:
         if profile and profile != "default":
-            from hermes_cli.config import read_raw_config
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_cli.config import fast_safe_load
 
-            return read_raw_config()
+            cfg_path = get_profile_dir(profile) / "config.yaml"
+            if not cfg_path.is_file():
+                return None
+            with open(cfg_path, encoding="utf-8") as f:
+                data = fast_safe_load(f) or {}
+            return data if isinstance(data, dict) else None
         from hermes_cli.config import load_config
 
         return load_config()
