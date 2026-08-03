@@ -23,12 +23,16 @@ def _fake_entry(session_id: str):
 
 @pytest.mark.asyncio
 async def test_check_requirements_defaults_off(monkeypatch):
-    """The tool must NOT be available unless explicitly enabled."""
+    """The tool must NOT be available unless explicitly enabled for the profile."""
 
     def _cfg_off():
         return {"agent": {}}
 
-    monkeypatch.setattr("hermes_cli.config.load_config", _cfg_off)
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda path: _cfg_off())
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "kosima" if name == "HERMES_SESSION_PROFILE" else default,
+    )
     assert reset_session_tool.check_requirements() is False
 
 
@@ -37,8 +41,39 @@ async def test_check_requirements_enabled(monkeypatch):
     def _cfg_on():
         return {"agent": {"allow_agent_session_reset": True}}
 
-    monkeypatch.setattr("hermes_cli.config.load_config", _cfg_on)
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda path: _cfg_on())
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "kosima" if name == "HERMES_SESSION_PROFILE" else default,
+    )
     assert reset_session_tool.check_requirements() is True
+
+
+@pytest.mark.asyncio
+async def test_check_requirements_default_profile_ignores_named_flag(monkeypatch):
+    """A flag set only on a named profile must not leak into the default profile.
+
+    The default profile reads load_config() (base config); a named profile
+    reads its own profile config via read_raw_config(). Scoping the gate by
+    profile means a kosima-only flag stays kosima-only.
+    """
+    # Base config (default profile) has NO flag; kosima profile config HAS it.
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"agent": {}})
+    monkeypatch.setattr(
+        "hermes_cli.config.read_raw_config",
+        lambda path: {"agent": {"allow_agent_session_reset": True}},
+    )
+
+    def _profile_ctx(profile: str):
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": profile if name == "HERMES_SESSION_PROFILE" else default,
+        )
+
+    _profile_ctx("kosima")
+    assert reset_session_tool.check_requirements() is True
+    _profile_ctx("default")
+    assert reset_session_tool.check_requirements() is False
 
 
 @pytest.mark.asyncio

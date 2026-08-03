@@ -83,6 +83,10 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Agent-initiated session reset (gated on agent.allow_agent_session_reset
+    # via check_fn; profile-scoped so a flag set on one profile does not leak
+    # into others under multiplex).
+    "reset_session",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -606,16 +610,10 @@ TOOLSETS = {
         "includes": []
     },
 
-    "session": {
-        "description": "Session lifecycle tools (agent-initiated session reset). Off by default; individual tools self-gate via config (e.g. agent.allow_agent_session_reset).",
-        "tools": ["reset_session"],
-        "includes": []
-    },
-
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao", "session"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao"]
     }
 }
 

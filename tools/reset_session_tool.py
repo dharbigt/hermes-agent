@@ -18,18 +18,52 @@ from typing import Optional
 from tools.registry import registry
 
 
-def check_requirements() -> bool:
-    """Only expose the tool when explicitly enabled in config.
+def _active_profile() -> Optional[str]:
+    """The profile serving the current session, if multiplexed.
 
-    Reads ``agent.allow_agent_session_reset`` (default False). Kept as a config
-    gate rather than an env var: it is non-secret behavior, and AGENTS.md
-    requires behavioral settings to live in config.yaml, not .env.
+    Under multiplex the gateway binds the active profile to the
+    HERMES_SESSION_PROFILE contextvar for the duration of a message task, so
+    we can scope the gate to that profile instead of the process-global base
+    config that ``load_config()`` returns.
     """
     try:
-        from hermes_cli.config import cfg_get, load_config
+        from gateway.session_context import get_session_env
 
-        cfg = load_config() or {}
-        return bool(cfg_get(cfg, "agent", "allow_agent_session_reset") or False)
+        return get_session_env("HERMES_SESSION_PROFILE", "") or None
+    except Exception:
+        return None
+
+
+def _load_config_for_profile(profile: Optional[str]):
+    """Load the config for ``profile`` (or the base config when None/'default')."""
+    try:
+        if profile and profile != "default":
+            from hermes_cli.config import read_raw_config
+            from hermes_constants import get_hermes_home
+
+            cfg_path = get_hermes_home() / "profiles" / profile / "config.yaml"
+            return read_raw_config(cfg_path)
+        from hermes_cli.config import load_config
+
+        return load_config()
+    except Exception:
+        return None
+
+
+def check_requirements() -> bool:
+    """Only expose the tool when explicitly enabled for the active profile.
+
+    Reads ``agent.allow_agent_session_reset``. The gate is profile-scoped: a
+    flag set on a named profile (e.g. kosima) must not leak into the default
+    profile, and the gateway process's base config must not hide a named
+    profile's setting. So we load the *active* profile's config (via the
+    session contextvar) rather than the process-global base config.
+    """
+    try:
+        from hermes_cli.config import cfg_get
+
+        cfg = _load_config_for_profile(_active_profile())
+        return bool(cfg_get(cfg or {}, "agent", "allow_agent_session_reset") or False)
     except Exception:
         return False
 
@@ -74,7 +108,7 @@ async def reset_session_tool(task_id: str = None) -> str:
 
 registry.register(
     name="reset_session",
-    toolset="session",
+    toolset="core",
     schema={
         "name": "reset_session",
         "description": (

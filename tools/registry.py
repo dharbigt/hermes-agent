@@ -213,7 +213,7 @@ class ToolEntry:
 # went down stops advertising its tools.
 # ---------------------------------------------------------------------------
 
-_CHECK_FN_TTL_SECONDS = 30.0
+_check_fn_ttl_seconds = 30.0
 # How long after a successful check a subsequent transient failure is treated
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
@@ -267,7 +267,6 @@ def check_fn_cache_scope() -> Optional[str]:
         # whose multiplex profile identity could not be resolved.
         return CHECK_FN_CACHE_BYPASS
 
-
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
@@ -276,6 +275,7 @@ def _check_fn_cached(fn: Callable) -> bool:
     last-good True is returned and the failure is NOT cached, so the next call
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
+
     """
     now = time.monotonic()
     scope = check_fn_cache_scope()
@@ -296,7 +296,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
-            if now - ts < _CHECK_FN_TTL_SECONDS:
+            if now - ts < _check_fn_ttl_seconds:
                 return value
 
     raised = False
@@ -319,8 +319,8 @@ def _check_fn_cached(fn: Callable) -> bool:
             # True and do NOT cache the failure, so the next call re-probes
             # rather than pinning a stale verdict for the full TTL.
             logger.warning(
-                "check_fn %s failed (%s) within %.0fs of last success; "
-                "treating as transient and keeping tool(s) available",
+                "check_fn %s failed (%s) within %.0fs of last "
+                "success; treating as transient and keeping tool(s) available",
                 getattr(fn, "__qualname__", fn),
                 "raised" if raised else "returned False",
                 _CHECK_FN_FAILURE_GRACE_SECONDS,
@@ -330,7 +330,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         # No recent success (or grace expired) — honor the failure. Log it so
         # silent tool loss in quiet mode (subagents) is diagnosable.
         logger.warning(
-            "check_fn %s %s; dependent tools will be unavailable this turn",
+                "check_fn %s %s; dependent tools will be unavailable this turn",
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
         )
