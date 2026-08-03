@@ -27,6 +27,7 @@ def _install_fake_adapter(monkeypatch, *, home_channels=("kosima",), greeting=""
         _recent_sent_ids={"stale1", "stale2"},
         clear_history=AsyncMock(return_value=True),
         send=AsyncMock(return_value=SimpleNamespace(success=True, error=None)),
+        _stop_typing_indicator=AsyncMock(return_value=True),
     )
     monkeypatch.setattr(kb, "_ACTIVE_INSTANCE", inst)
     return inst
@@ -53,15 +54,52 @@ async def test_hook_clears_history_and_greets_reset_conversation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_hook_falls_back_to_home_channel_without_chat_id(monkeypatch):
+async def test_hook_recovers_chat_id_from_session_key_when_kwarg_absent(monkeypatch):
+    """When the hook gets a session_key carrying a chat_id but no explicit
+    chat_id kwarg, it must target that conversation (not the home channel).
+    """
     inst = _install_fake_adapter(monkeypatch, home_channels=("kosima",))
 
     kb._on_keybase_session_reset(platform="keybase", session_key="agent:kosima:keybase:dm:CONVX")
     await asyncio.sleep(0.05)
 
-    # No chat_id -> greet the first home channel.
+    inst.clear_history.assert_awaited_once_with("CONVX")
+    target, _ = inst.send.await_args.args
+    assert target == "CONVX"
+
+
+@pytest.mark.asyncio
+async def test_hook_falls_back_to_home_channel_when_no_chat_id_or_session_key(monkeypatch):
+    """Only when neither an explicit chat_id nor a parseable session_key is
+    available does the greeting fall back to the first home channel.
+    """
+    inst = _install_fake_adapter(monkeypatch, home_channels=("kosima",))
+
+    kb._on_keybase_session_reset(platform="keybase")  # no chat_id, no session_key
+    await asyncio.sleep(0.05)
+
     target, _ = inst.send.await_args.args
     assert target == "kosima"
+
+
+@pytest.mark.asyncio
+async def test_hook_recovers_platform_and_chat_id_from_session_key(monkeypatch):
+    """Regression: the agent-initiated reset_session path may pass the hook
+    with platform/chat_id omitted (source=None). The hook must recover them
+    from the session_key (agent:<profile>:<platform>:<type>:<chat_id>) so it
+    still fires for keybase and targets the right conversation.
+    """
+    inst = _install_fake_adapter(monkeypatch)
+
+    kb._on_keybase_session_reset(
+        # no platform / chat_id kwargs — only the session_key
+        session_key="agent:kosima:keybase:dm:CONVRESET",
+    )
+    await asyncio.sleep(0.05)
+
+    inst.clear_history.assert_awaited_once_with("CONVRESET")
+    target, _ = inst.send.await_args.args
+    assert target == "CONVRESET"
 
 
 @pytest.mark.asyncio

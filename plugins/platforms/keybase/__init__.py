@@ -1228,22 +1228,42 @@ def _on_keybase_session_reset(**kwargs: Any) -> None:
     clear off the event loop so it never blocks the reset; failures are
     logged and swallowed.
 
-    Agent-initiated ``reset_session`` used to omit ``source``, which left
-    ``platform`` empty and skipped this hook entirely — Hermes rotated the
-    transcript but Keybase chat history stayed. The gateway now fills
-    platform/chat_id from the session entry/session_key when source is
-    missing; still accept either form here.
+    Agent-initiated ``reset_session`` may pass ``source=None``, so the
+    gateway derives platform/chat_id from the session entry/session_key — but
+    if those come back empty the hook used to early-return and Keybase chat
+    history stayed. Self-heal here: recover platform + chat_id from the
+    session_key (``agent:<profile>:<platform>:<type>:<chat_id>``) whenever the
+    explicit kwargs are missing, so the clear + greeting always target the
+    right conversation. Still accept either form.
     """
-    if kwargs.get("platform") != "keybase":
+    _raw_platform = kwargs.get("platform")
+    _raw_chat_id = kwargs.get("chat_id")
+    _session_key = kwargs.get("session_key") or ""
+    logger.info(
+        "Keybase on_session_reset CALLED: raw_platform=%r raw_chat_id=%r session_key=%r",
+        _raw_platform, _raw_chat_id, _session_key,
+    )
+
+    platform = _raw_platform or ""
+    if not platform:
+        _parts = _session_key.split(":")
+        if len(_parts) >= 3 and _parts[0] == "agent":
+            platform = _parts[2]
+    if platform != "keybase":
+        logger.debug("Keybase on_session_reset: ignoring platform=%r", platform)
         return
     inst = _ACTIVE_INSTANCE
     if inst is None:
-        logger.debug("Keybase on_session_reset: no active adapter instance")
+        logger.warning("Keybase on_session_reset: no active adapter instance")
         return
 
-    chat_id = kwargs.get("chat_id") or None
+    chat_id = _raw_chat_id or None
     if isinstance(chat_id, str):
         chat_id = chat_id.strip() or None
+    if not chat_id and _session_key:
+        _parts = _session_key.split(":")
+        if len(_parts) >= 5 and _parts[0] == "agent":
+            chat_id = _parts[4]
 
     _DEFAULT_GREETING = (
         "New session started. The previous conversation has been cleared — "
@@ -1254,12 +1274,18 @@ def _on_keybase_session_reset(**kwargs: Any) -> None:
         try:
             # 1) Wipe the visible Keybase chat history for this conversation.
             await inst.clear_history(chat_id)
-            # 2) Drop any in-memory send buffer / typing state so no stale
-            #    message ids or indicators linger into the new session.
-            inst._recent_sent_ids.clear()
-            inst._stop_typing_indicator(chat_id) if chat_id else None
         except Exception as exc:  # never block the reset on a clear failure
             logger.warning("Keybase on_session_reset clear failed: %s", exc)
+
+        # 2) Drop any in-memory send buffer / typing state so no stale
+        #    message ids or indicators linger into the new session. Kept in
+        #    its own guard so a missing/raised helper can't block the greeting.
+        try:
+            inst._recent_sent_ids.clear()
+            if chat_id:
+                inst._stop_typing_indicator(chat_id)
+        except Exception as exc:
+            logger.debug("Keybase on_session_reset buffer/typing cleanup skipped: %s", exc)
 
         # 3) Post a fresh, unprompted salutatory message so the wiped chat
         #    reads as a brand-new session. Runs after the clear so it isn't
