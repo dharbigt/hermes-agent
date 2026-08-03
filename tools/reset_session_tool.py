@@ -35,14 +35,19 @@ def _active_profile() -> Optional[str]:
 
 
 def _load_config_for_profile(profile: Optional[str]):
-    """Load the config for ``profile`` (or the base config when None/'default')."""
+    """Load the config for ``profile`` (or the base config when None/'default').
+
+    Under multiplex the gateway sets a per-task HERMES_HOME override to the
+    active profile's home, so ``read_raw_config()`` (which resolves its path
+    via ``get_config_path()``) already reads that profile's own config.yaml —
+    no manual path construction needed (and none that could double-nest under
+    ``profiles/<name>/profiles/<name>``).
+    """
     try:
         if profile and profile != "default":
             from hermes_cli.config import read_raw_config
-            from hermes_constants import get_hermes_home
 
-            cfg_path = get_hermes_home() / "profiles" / profile / "config.yaml"
-            return read_raw_config(cfg_path)
+            return read_raw_config()
         from hermes_cli.config import load_config
 
         return load_config()
