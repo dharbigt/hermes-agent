@@ -112,6 +112,10 @@ CONFIGURABLE_TOOLSETS = [
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
+    # Owns reset_session so platform reverse-mapping enables it. The real
+    # gate is agent.allow_agent_session_reset (check_fn); keep default-on
+    # here so enabling the flag alone is enough (no second hermes-tools flip).
+    ("session",         "🔄 Session Reset",             "reset_session (requires agent.allow_agent_session_reset)"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),

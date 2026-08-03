@@ -255,6 +255,22 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Agent-initiated /reset. Also listed in _HERMES_CORE_TOOLS so every
+    # hermes-* composite includes it; this named toolset exists so platform
+    # reverse-mapping (_get_platform_tools → CONFIGURABLE_TOOLSETS) can
+    # enable it. Without a configurable owner the tool is orphaned: present
+    # in the composite and gated True, but never in enabled_toolsets, so
+    # get_tool_definitions never offers it. check_fn
+    # (agent.allow_agent_session_reset) remains the real availability gate.
+    "session": {
+        "description": (
+            "Agent-initiated session reset (reset_session). Offered only when "
+            "agent.allow_agent_session_reset is enabled for the active profile."
+        ),
+        "tools": ["reset_session"],
+        "includes": []
+    },
+
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["project_list", "project_create", "project_switch"],

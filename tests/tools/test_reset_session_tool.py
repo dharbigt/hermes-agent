@@ -135,6 +135,26 @@ async def test_check_requirements_default_profile_ignores_named_flag(
     assert reset_session_tool.check_requirements() is False
 
 
+def test_reset_session_is_owned_by_configurable_session_toolset():
+    """Orphan guard: platform reverse-mapping only enables CONFIGURABLE toolsets.
+
+    reset_session must live in a configurable toolset whose static membership
+    is a subset of hermes-* composites (via _HERMES_CORE_TOOLS). Otherwise the
+    gate can be True while get_tool_definitions never offers the tool.
+    """
+    from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_platform_tools
+    from toolsets import _HERMES_CORE_TOOLS, resolve_toolset
+
+    assert "reset_session" in _HERMES_CORE_TOOLS
+    assert any(k == "session" for k, _, _ in CONFIGURABLE_TOOLSETS)
+    assert resolve_toolset("session", include_registry=False) == ["reset_session"]
+    assert "reset_session" in resolve_toolset("hermes-cli", include_registry=False)
+
+    # Default platform config reverse-maps session on for cli/telegram.
+    assert "session" in _get_platform_tools({}, "cli")
+    assert "session" in _get_platform_tools({}, "telegram")
+
+
 @pytest.mark.asyncio
 async def test_handler_resets_via_runner(monkeypatch):
     """Handler drives the shared teardown and returns the new session id."""

@@ -128,7 +128,10 @@ async def reset_session_tool(task_id: str = None) -> str:
 
 registry.register(
     name="reset_session",
-    toolset="core",
+    # Named toolset must match TOOLSETS/CONFIGURABLE_TOOLSETS "session" so
+    # platform reverse-mapping enables it. Still listed in _HERMES_CORE_TOOLS
+    # so hermes-* composites include the tool name.
+    toolset="session",
     schema={
         "name": "reset_session",
         "description": (
