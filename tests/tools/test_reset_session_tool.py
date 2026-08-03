@@ -175,7 +175,10 @@ async def test_handler_resets_via_runner(monkeypatch):
         lambda name: "agent:kosima:keybase:dm:abc" if name == "HERMES_SESSION_KEY" else "",
     )
 
-    result = json.loads(await reset_session_tool.reset_session_tool())
+    # Registry shape: handler(args, task_id=...).
+    result = json.loads(
+        await reset_session_tool.reset_session_tool({}, task_id="caller-task")
+    )
     assert result["success"] is True
     assert result["new_session_id"] == "brand-new-sid"
     assert captured["session_key"] == "agent:kosima:keybase:dm:abc"
@@ -185,7 +188,9 @@ async def test_handler_resets_via_runner(monkeypatch):
 @pytest.mark.asyncio
 async def test_handler_no_runner(monkeypatch):
     monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
-    result = json.loads(await reset_session_tool.reset_session_tool())
+    result = json.loads(
+        await reset_session_tool.reset_session_tool({}, task_id="t")
+    )
     assert result["success"] is False
     assert "gateway runner" in result["error"]
 
@@ -196,6 +201,8 @@ async def test_handler_no_session_key(monkeypatch):
     monkeypatch.setattr(
         "gateway.session_context.get_session_env", lambda name: ""
     )
-    result = json.loads(await reset_session_tool.reset_session_tool())
+    result = json.loads(
+        await reset_session_tool.reset_session_tool({}, task_id="t")
+    )
     assert result["success"] is False
     assert "session key" in result["error"]

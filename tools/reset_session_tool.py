@@ -88,9 +88,13 @@ def check_requirements() -> bool:
         return False
 
 
-async def reset_session_tool(task_id: str = None) -> str:
+async def reset_session_tool(args=None, **kwargs) -> str:
     """Reset the agent's current session (clear conversation history and start
     fresh) on behalf of the agent.
+
+    Registry dispatch is ``handler(args, **kwargs)`` (kwargs include
+    ``task_id``). Accept that signature and ignore both — the active session
+    is resolved from gateway session context, not tool args.
 
     Returns a JSON string with ``success`` and the new ``session_id``, or an
     error describing why the reset could not be performed.
