@@ -4518,10 +4518,13 @@ class TurnRunner:
         # when the agent was cached; on mismatch, invalidate the cache
         # so a fresh agent re-reads from disk. (#45966)
         _current_msg_count = None
-        if self._runner._session_db is not None and ctx.session_id:
+        _profile_session_db = self._runner._session_db_for(
+            source=ctx.source, session_key=ctx.session_key
+        )
+        if _profile_session_db is not None and ctx.session_id:
             try:
                 # run_sync is off-loop (executor); sync DB is fine.
-                _sess_row = self._runner._session_db._db.get_session(ctx.session_id)
+                _sess_row = _profile_session_db.get_session(ctx.session_id)
                 if _sess_row:
                     _current_msg_count = _sess_row.get("message_count", 0)
             except Exception:
@@ -4704,7 +4707,9 @@ class TurnRunner:
                 chat_type=ctx.source.chat_type,
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
-                session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
+                session_db=self._runner._session_db_for(
+                    source=ctx.source, session_key=ctx.session_key
+                ),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
                 skip_context_files=skip_context_files,
@@ -16832,7 +16837,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc,
                                         exc_info=True,
                                     )
-                                _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
+                                _hyg_session_db = self._session_db_for(
+                                    source=source,
+                                    session_key=getattr(session_entry, "session_key", None)
+                                    or session_key,
+                                )
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
@@ -19388,7 +19397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
-                    session_db=getattr(self._session_db, "_db", self._session_db),
+                    session_db=self._session_db_for(source=source),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
@@ -23969,6 +23978,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
             )
+
+    def _session_db_for(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ):
+        """Return the SessionDB the agent should persist this turn into.
+
+        Under multiplex, ProfileRoutedSessionStore owns a per-profile state.db.
+        The agent must share that handle; the process-global self._session_db is
+        the default profile's DB and would otherwise make every profile-routed
+        transcript appear under default in the dashboard.
+        """
+        store = getattr(self, "session_store", None)
+        getter = getattr(store, "db_for", None) if store is not None else None
+        if callable(getter):
+            try:
+                db = getter(source=source, session_key=session_key)
+                if db is not None:
+                    return db
+            except Exception:
+                logger.debug(
+                    "profile-scoped session_db lookup failed; falling back to global",
+                    exc_info=True,
+                )
+        session_db = getattr(self, "_session_db", None)
+        return getattr(session_db, "_db", session_db)
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.

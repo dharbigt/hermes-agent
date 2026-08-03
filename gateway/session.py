@@ -1401,16 +1401,29 @@ class ProfileRoutedSessionStore:
                 target = self._store_for(prof)
                 if target is global_store:
                     continue
-                # Skip if the row already exists in the target db (idempotent).
+                # When the target already has this session_id, prefer the side with
+                # the richer transcript. The agent historically wrote messages
+                # into the gateway's process-global SessionDB (default
+                # state.db) even for profile-routed keys, so the live
+                # conversation can sit in the global db while the profile db
+                # only has a thin shell created by SessionStore.reset_session.
+                # Blindly deleting the global row would destroy that transcript.
                 tdb = getattr(target, "_db", None)
                 if tdb is not None:
                     try:
                         if tdb.get_session(session_id) is not None:
-                            # Already migrated; just delete the stale global row.
-                            try:
-                                gdb.delete_session(session_id)
-                            except Exception:
-                                pass
+                            g_count = self._message_count_in_db(gdb, session_id)
+                            t_count = self._message_count_in_db(tdb, session_id)
+                            if g_count > t_count:
+                                self._migrate_session_db_row(
+                                    global_store, target, session_id
+                                )
+                                moved += 1
+                            else:
+                                try:
+                                    gdb.delete_session(session_id)
+                                except Exception:
+                                    pass
                             continue
                     except Exception:
                         pass
@@ -1419,6 +1432,26 @@ class ProfileRoutedSessionStore:
         finally:
             gcon.close()
         return moved
+
+    @staticmethod
+    def _message_count_in_db(db, session_id: str) -> int:
+        """Best-effort message count for a session id in a SessionDB."""
+        if db is None or not session_id:
+            return 0
+        try:
+            row = db.get_session(session_id)
+            if row and row.get("message_count") is not None:
+                return int(row.get("message_count") or 0)
+        except Exception:
+            pass
+        try:
+            getter = getattr(db, "get_messages", None)
+            if callable(getter):
+                msgs = getter(session_id) or []
+                return len(msgs) if isinstance(msgs, list) else 0
+        except Exception:
+            pass
+        return 0
 
     @staticmethod
     def _migrate_session_db_row(global_store, target_store, session_id: str) -> None:
@@ -1562,6 +1595,18 @@ class ProfileRoutedSessionStore:
                 if entry is not None:
                     return entry
         return None
+
+    def db_for(self, *, source=None, session_key: Optional[str] = None):
+        """Return the ``SessionDB`` that owns this session's transcript.
+
+        Under multiplex, routing metadata already lives in the per-profile
+        ``SessionStore`` (and its ``state.db``). The AIAgent must write its
+        message transcript to that same DB — otherwise the dashboard, which
+        lists sessions from each profile's ``state.db``, shows new turns under
+        the default profile while the gateway route sits under the named one.
+        """
+        store = self._store_for(self._arg_profile(source=source, session_key=session_key))
+        return getattr(store, "_db", None)
 
     def _generate_session_key(self, source: SessionSource) -> str:
         profile = self._arg_profile(source=source)

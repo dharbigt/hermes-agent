@@ -654,6 +654,7 @@ class AIAgent:
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
+                session_key=getattr(self, "_gateway_session_key", None) or None,
             )
             self._session_db_created = True
         except Exception as e:

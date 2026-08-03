@@ -267,3 +267,88 @@ def test_routed_store_entries_attribute_is_dict_not_function(tmp_path):
     finally:
         hp.get_profile_dir = _orig_dir
         hp.profile_exists = _orig_exists
+
+def test_db_for_returns_profile_state_db(tmp_path):
+    """Agent persistence must use the profile store's state.db, not global."""
+    cfg = _temp_config()
+    profile_dir = tmp_path / "profiles" / "kosima"
+    (profile_dir / "sessions").mkdir(parents=True)
+    cfg.sessions_dir = tmp_path / "global"
+
+    global_store = SessionStore(cfg.sessions_dir, cfg)
+
+    import hermes_cli.profiles as hp
+
+    _orig_dir = hp.get_profile_dir
+    _orig_exists = hp.profile_exists
+    hp.get_profile_dir = lambda n: tmp_path / "profiles" / n
+    hp.profile_exists = lambda n: (tmp_path / "profiles" / n).exists()
+    try:
+        routed = ProfileRoutedSessionStore(global_store, cfg)
+        src = _make_source(profile="kosima")
+        key = "agent:kosima:keybase:dm:conv-dbfor"
+        pdb = routed.db_for(source=src)
+        assert pdb is not None
+        assert Path(pdb.db_path) == profile_dir / "state.db"
+        assert routed.db_for(session_key=key) is pdb
+        # default stays on the global store
+        assert routed.db_for(session_key="agent:main:keybase:dm:x") is global_store._db
+    finally:
+        hp.get_profile_dir = _orig_dir
+        hp.profile_exists = _orig_exists
+
+
+def test_orphan_prefers_richer_global_transcript(tmp_path):
+    """When both DBs share a session_id, keep the side with more messages.
+
+    Regression for the multiplex split where SessionStore wrote a thin shell
+    into the profile db while the agent wrote the live transcript into the
+    global default state.db. Blind-delete of the global row destroyed history.
+    """
+    cfg = _temp_config()
+    profile_dir = tmp_path / "profiles" / "kosima"
+    (profile_dir / "sessions").mkdir(parents=True)
+    cfg.sessions_dir = tmp_path / "global"
+
+    global_store = SessionStore(cfg.sessions_dir, cfg)
+    key = _seed_global_store_with_profile_key(global_store, "kosima", "rich")
+    sid = global_store._entries[key].session_id
+
+    from hermes_state import SessionDB
+
+    # Thin shell already in profile db (as after reset_session).
+    import hermes_cli.profiles as hp
+
+    _orig_dir = hp.get_profile_dir
+    _orig_exists = hp.profile_exists
+    hp.get_profile_dir = lambda n: tmp_path / "profiles" / n
+    hp.profile_exists = lambda n: (tmp_path / "profiles" / n).exists()
+    try:
+        routed = ProfileRoutedSessionStore(global_store, cfg)
+        kosima_store = routed._store_for("kosima")
+        kdb = kosima_store._db
+        kdb.create_session(sid, "keybase", session_key=key, profile_name="kosima")
+        kdb.replace_messages(sid, [
+            {"role": "user", "content": "old shell"},
+        ])
+
+        # Live transcript wrongly landed in global db.
+        gdb = global_store._db
+        gdb.create_session(sid, "keybase", profile_name="kosima")
+        gdb.replace_messages(sid, [
+            {"role": "user", "content": "live 1"},
+            {"role": "assistant", "content": "live 2"},
+            {"role": "user", "content": "live 3"},
+        ])
+
+        moved = routed._migrate_orphan_state_db_rows(global_store)
+        assert moved >= 1
+        assert gdb.get_session(sid) is None
+        msgs = kdb.get_messages(sid)
+        assert len(msgs) >= 3
+        contents = " ".join(str(m.get("content") or "") for m in msgs)
+        assert "live 1" in contents
+    finally:
+        hp.get_profile_dir = _orig_dir
+        hp.profile_exists = _orig_exists
+

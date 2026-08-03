@@ -3948,10 +3948,13 @@ class GatewaySlashCommandsMixin:
             # but _compress_context may persist its cached system prompt. Restore
             # the exact live-session prompt so provider blocks are retained.
             session_row = None
-            get_session = getattr(self._session_db, "get_session", None)
-            if callable(get_session):
+            profile_db = self._session_db_for(
+                source=source,
+                session_key=getattr(session_entry, "session_key", None) or session_key,
+            )
+            if profile_db is not None:
                 try:
-                    session_row = await get_session(session_entry.session_id)
+                    session_row = profile_db.get_session(session_entry.session_id)
                 except Exception as exc:
                     logger.warning(
                         "Manual compression could not restore the system prompt "
@@ -3970,7 +3973,7 @@ class GatewaySlashCommandsMixin:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
-                session_db=getattr(self._session_db, "_db", self._session_db),
+                session_db=profile_db,
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
             # Keep the real source platform during construction so external
