@@ -213,7 +213,7 @@ class ToolEntry:
 # went down stops advertising its tools.
 # ---------------------------------------------------------------------------
 
-_check_fn_ttl_seconds = 30.0
+_CHECK_FN_TTL_SECONDS = 30.0
 # How long after a successful check a subsequent transient failure is treated
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
