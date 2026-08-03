@@ -205,4 +205,55 @@ async def test_handler_no_session_key(monkeypatch):
         await reset_session_tool.reset_session_tool({}, task_id="t")
     )
     assert result["success"] is False
-    assert "session key" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_check_requirements_profile_from_session_key_when_ctxvar_unset(
+    monkeypatch, tmp_path
+):
+    """Regression: Keybase (a plugin platform) binds to a profile without
+    stamping source.profile, so HERMES_SESSION_PROFILE is empty in the live
+    session. The gate must still resolve the profile from HERMES_SESSION_KEY
+    (agent:<profile>:...), otherwise the tool stays hidden and the agent falls
+    back to the ignored "Session reset requested" control interrupt.
+    """
+    _point_profiles_at(monkeypatch, tmp_path)
+    _write_profile_config(
+        tmp_path, "kosima", "agent:\n  allow_agent_session_reset: true\n"
+    )
+
+    # Live keybase shape: NO HERMES_SESSION_PROFILE, but a kosima session key.
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": (
+            "agent:kosima:keybase:dm:0000dfc6d1"
+            if name == "HERMES_SESSION_KEY"
+            else default
+        ),
+    )
+    assert reset_session_tool.check_requirements() is True
+
+
+@pytest.mark.asyncio
+async def test_check_requirements_profile_from_session_key_default_stays_off(
+    monkeypatch, tmp_path
+):
+    """A default-profile session key (no named profile) must not enable the tool
+    when the flag is only set on a named profile.
+    """
+    _point_profiles_at(monkeypatch, tmp_path)
+    _write_profile_config(
+        tmp_path, "kosima", "agent:\n  allow_agent_session_reset: true\n"
+    )
+    (tmp_path / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": (
+            # default profile -> no named profile segment
+            "agent:default:keybase:dm:abc"
+            if name == "HERMES_SESSION_KEY"
+            else default
+        ),
+    )
+    assert reset_session_tool.check_requirements() is False

@@ -25,13 +25,26 @@ def _active_profile() -> Optional[str]:
     HERMES_SESSION_PROFILE contextvar for the duration of a message task, so
     we can scope the gate to that profile instead of the process-global base
     config that ``load_config()`` returns.
+
+    Some plugin platforms (e.g. Keybase) bind to a profile without stamping
+    ``source.profile``, so HERMES_SESSION_PROFILE may be empty even though the
+    session is multiplexed. Fall back to the session key, which always carries
+    the profile: ``agent:<profile>:...``. This keeps the gate correct even when
+    the platform adapter doesn't populate the profile on its SessionSource.
     """
     try:
         from gateway.session_context import get_session_env
 
-        return get_session_env("HERMES_SESSION_PROFILE", "") or None
+        profile = get_session_env("HERMES_SESSION_PROFILE", "") or ""
+        if profile:
+            return profile
+        session_key = get_session_env("HERMES_SESSION_KEY", "") or ""
+        parts = session_key.split(":")
+        if len(parts) >= 2 and parts[0] == "agent":
+            return parts[1] or None
     except Exception:
         return None
+    return None
 
 
 def _load_config_for_profile(profile: Optional[str]):
