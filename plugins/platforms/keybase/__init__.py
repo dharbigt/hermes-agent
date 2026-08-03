@@ -210,6 +210,16 @@ class KeybaseAdapter(BasePlatformAdapter):
         ).strip()
         self.home_channels: List[str] = _parse_comma_list(home_channel)
 
+        # Greeting the agent posts to the conversation after a session reset,
+        # so the wiped chat reads like a fresh session start. Empty -> a built-in
+        # default. Override via KEYBASE_GREETING_AFTER_RESET or the platform
+        # config's ``greeting_after_reset`` extra.
+        self.greeting_after_reset: str = (
+            get_secret("KEYBASE_GREETING_AFTER_RESET")
+            or extra.get("greeting_after_reset")
+            or ""
+        ).strip()
+
         # Background process/tasks
         self._keybase_service_proc: Optional[asyncio.subprocess.Process] = None
         self._listen_proc: Optional[asyncio.subprocess.Process] = None
@@ -1212,10 +1222,17 @@ class KeybaseAdapter(BasePlatformAdapter):
 def _on_keybase_session_reset(**kwargs: Any) -> None:
     """Plugin hook fired by the gateway on session reset.
 
-    The gateway's ``on_session_reset`` hook does not carry the conversation
-    id, so we clear the adapter's configured home channels (KEYBASE_HOME_CHANNEL
-    / config ``home_channel``). Runs the pty-backed clear off the event loop so
-    it never blocks the reset; failures are logged and swallowed.
+    Prefer ``chat_id`` from the hook payload (the conversation that reset)
+    and fall back to the adapter's configured home channels
+    (KEYBASE_HOME_CHANNEL / config ``home_channel``). Runs the pty-backed
+    clear off the event loop so it never blocks the reset; failures are
+    logged and swallowed.
+
+    Agent-initiated ``reset_session`` used to omit ``source``, which left
+    ``platform`` empty and skipped this hook entirely — Hermes rotated the
+    transcript but Keybase chat history stayed. The gateway now fills
+    platform/chat_id from the session entry/session_key when source is
+    missing; still accept either form here.
     """
     if kwargs.get("platform") != "keybase":
         return
@@ -1224,17 +1241,49 @@ def _on_keybase_session_reset(**kwargs: Any) -> None:
         logger.debug("Keybase on_session_reset: no active adapter instance")
         return
 
-    async def _clear() -> None:
+    chat_id = kwargs.get("chat_id") or None
+    if isinstance(chat_id, str):
+        chat_id = chat_id.strip() or None
+
+    _DEFAULT_GREETING = (
+        "New session started. The previous conversation has been cleared — "
+        "what would you like to do?"
+    )
+
+    async def _after_reset() -> None:
         try:
-            await inst.clear_history(None)
+            # 1) Wipe the visible Keybase chat history for this conversation.
+            await inst.clear_history(chat_id)
+            # 2) Drop any in-memory send buffer / typing state so no stale
+            #    message ids or indicators linger into the new session.
+            inst._recent_sent_ids.clear()
+            inst._stop_typing_indicator(chat_id) if chat_id else None
         except Exception as exc:  # never block the reset on a clear failure
-            logger.warning("Keybase on_session_reset clear_history failed: %s", exc)
+            logger.warning("Keybase on_session_reset clear failed: %s", exc)
+
+        # 3) Post a fresh, unprompted salutatory message so the wiped chat
+        #    reads as a brand-new session. Runs after the clear so it isn't
+        #    itself wiped.
+        greeting = inst.greeting_after_reset or _DEFAULT_GREETING
+        target = chat_id or (inst.home_channels[0] if inst.home_channels else None)
+        if not target:
+            logger.debug("Keybase on_session_reset: no chat_id/home to greet")
+            return
+        try:
+            result = await inst.send(target, greeting)
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "Keybase on_session_reset greeting send failed: %s",
+                    getattr(result, "error", "unknown"),
+                )
+        except Exception as exc:
+            logger.warning("Keybase on_session_reset greeting failed: %s", exc)
 
     try:
         loop = asyncio.get_event_loop()
-        asyncio.ensure_future(_clear())
+        asyncio.ensure_future(_after_reset())
     except RuntimeError:
-        logger.debug("Keybase on_session_reset: no running loop to schedule clear")
+        logger.debug("Keybase on_session_reset: no running loop to schedule")
 
 
 def register(ctx) -> None:

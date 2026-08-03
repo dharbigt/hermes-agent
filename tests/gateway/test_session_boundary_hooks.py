@@ -226,3 +226,136 @@ async def test_idle_expiry_clears_last_resolved_model(mock_invoke_hook):
         "session-expiry finalization must only clear the expired session's "
         "own key, not unrelated sessions' cached entries"
     )
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.lifecycle.invoke_hook")
+async def test_agent_reset_without_source_fills_platform_and_chat_id(mock_invoke_hook):
+    """Agent reset_session has no MessageEvent source.
+
+    Platform plugins (Keybase clear-history) gate on platform/chat_id from
+    on_session_reset. Without falling back to the session entry/session_key,
+    Hermes rotates the transcript but skips the Keybase buffer clear.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    kb_platform = Platform("keybase")
+    chat_id = "0000dfc6d100dec4af4803db4f284fc2174f2afa574400f53149cd377fcfca7f"
+    session_key = f"agent:kosima:keybase:dm:{chat_id}"
+    origin = SessionSource(
+        platform=kb_platform,
+        user_id="dharbigt",
+        chat_id=chat_id,
+        user_name="dharbigt",
+        chat_type="dm",
+        profile="kosima",
+    )
+    old_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-old-kb",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=kb_platform,
+        chat_type="dm",
+        origin=origin,
+        display_name="dharbigt",
+    )
+    new_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-new-kb",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=kb_platform,
+        chat_type="dm",
+        origin=origin,
+        display_name="dharbigt",
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: old_entry}
+    runner._agent_cache_lock = None
+    runner._agent_cache = {}
+    runner._evict_cached_agent = MagicMock()
+    runner._clear_conversation_scope = MagicMock()
+    runner._invalidate_session_run_generation = MagicMock()
+    runner._release_running_agent_state = MagicMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._async_session_store = SimpleNamespace(
+        reset_session=AsyncMock(return_value=new_entry),
+        _routed=runner.session_store,
+    )
+
+    result = await GatewaySlashCommandsMixin._reset_session_by_key(
+        runner, session_key, reason="agent_session_reset", source=None
+    )
+    assert result is new_entry
+
+    reset_calls = [
+        c for c in mock_invoke_hook.call_args_list
+        if c[0] and c[0][0] == "on_session_reset"
+    ]
+    assert reset_calls, "on_session_reset must fire for agent-initiated reset"
+    kwargs = reset_calls[-1].kwargs
+    assert kwargs.get("platform") == "keybase"
+    assert kwargs.get("chat_id") == chat_id
+    assert kwargs.get("session_key") == session_key
+    assert kwargs.get("new_session_id") == "sess-new-kb"
+
+    emit_platforms = {
+        call.args[1].get("platform")
+        for call in runner.hooks.emit.await_args_list
+        if call.args
+    }
+    assert "keybase" in emit_platforms
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.lifecycle.invoke_hook")
+async def test_agent_reset_derives_platform_from_multiplex_session_key(
+    mock_invoke_hook,
+):
+    """Even without origin/platform on the entry, multiplex session keys
+    carry agent:{profile}:{platform}:{chat_type}:{chat_id}.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    chat_id = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+    session_key = f"agent:kosima:keybase:dm:{chat_id}"
+    old_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-old",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        # Intentionally no platform/origin — force session_key parse path.
+    )
+    new_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-new",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: old_entry}
+    runner._agent_cache_lock = None
+    runner._agent_cache = {}
+    runner._evict_cached_agent = MagicMock()
+    runner._clear_conversation_scope = MagicMock()
+    runner._invalidate_session_run_generation = MagicMock()
+    runner._release_running_agent_state = MagicMock()
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._async_session_store = SimpleNamespace(
+        reset_session=AsyncMock(return_value=new_entry),
+        _routed=runner.session_store,
+    )
+
+    await GatewaySlashCommandsMixin._reset_session_by_key(
+        runner, session_key, reason="agent_session_reset", source=None
+    )
+    kwargs = mock_invoke_hook.call_args_list[-1].kwargs
+    assert kwargs.get("platform") == "keybase"
+    assert kwargs.get("chat_id") == chat_id

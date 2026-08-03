@@ -201,8 +201,39 @@ class GatewaySlashCommandsMixin:
         new_entry = await self.async_session_store.reset_session(session_key)
 
         _old_sid = old_entry.session_id if old_entry else None
-        _platform = source.platform.value if source and getattr(source, "platform", None) else ""
-        _user_id = source.user_id if source else ""
+        # Agent-callable reset_session has no MessageEvent, so ``source`` is
+        # often None. Platform plugins (Keybase clear-history, etc.) gate on
+        # platform/chat_id from these hooks — fall back to the live session
+        # entry / session_key so agent-initiated resets match /reset.
+        if source is None and old_entry is not None:
+            source = getattr(old_entry, "origin", None)
+
+        def _platform_value(obj) -> str:
+            plat = getattr(obj, "platform", None) if obj is not None else None
+            if plat is None:
+                return ""
+            return getattr(plat, "value", None) or str(plat) or ""
+
+        _platform = _platform_value(source)
+        _user_id = (getattr(source, "user_id", None) or "") if source else ""
+        _chat_id = (getattr(source, "chat_id", None) or "") if source else ""
+        if not _platform and old_entry is not None:
+            _platform = _platform_value(old_entry)
+        if (not _platform or not _chat_id) and session_key:
+            # agent:{profile|main}:{platform}:{chat_type}:{chat_id}[:...]
+            parts = str(session_key).split(":")
+            if len(parts) >= 5 and parts[0] == "agent":
+                if not _platform:
+                    _platform = parts[2] or ""
+                if not _chat_id:
+                    _chat_id = parts[4] or ""
+        if not _user_id and old_entry is not None:
+            origin = getattr(old_entry, "origin", None)
+            _user_id = (
+                getattr(origin, "user_id", None)
+                or getattr(old_entry, "display_name", None)
+                or ""
+            )
 
         # Fire plugin on_session_finalize hook (session boundary)
         try:
@@ -217,19 +248,18 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Emit session:end hook (session is ending)
-        await self.hooks.emit("session:end", {
+        _hook_payload = {
             "platform": _platform,
             "user_id": _user_id,
             "session_key": session_key,
-        })
+            "chat_id": _chat_id,
+        }
+
+        # Emit session:end hook (session is ending)
+        await self.hooks.emit("session:end", _hook_payload)
 
         # Emit session:reset hook
-        await self.hooks.emit("session:reset", {
-            "platform": _platform,
-            "user_id": _user_id,
-            "session_key": session_key,
-        })
+        await self.hooks.emit("session:reset", _hook_payload)
 
         # Fire plugin on_session_reset hook (new session guaranteed to exist)
         try:
@@ -242,6 +272,9 @@ class GatewaySlashCommandsMixin:
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=_new_sid,
+                chat_id=_chat_id,
+                session_key=session_key,
+                user_id=_user_id,
             )
         except Exception:
             pass
