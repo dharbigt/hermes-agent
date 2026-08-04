@@ -13286,9 +13286,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if listener_claim is not None:
                         claimed[listener_claim] = profile_name
                     connected += 1
+                    # Mirror the primary startup path: persist the connected
+                    # state so the dashboard's gateway_state.json reflects this
+                    # secondary-profile adapter instead of sitting on a stale
+                    # "retrying" left by an earlier failed run. Without this the
+                    # multiplexer connects keybase (etc.) and serves messages
+                    # correctly, but the Channels page never flips to connected.
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="connected",
+                        error_code=None,
+                        error_message=None,
+                    )
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
                     logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="retrying" if getattr(adapter, "fatal_error_retryable", True) else "fatal",
+                        error_code=getattr(adapter, "fatal_error_code", None),
+                        error_message=getattr(adapter, "fatal_error_message", None),
+                    )
                     await self._safe_adapter_disconnect(adapter, platform)
             except Exception as e:
                 logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)

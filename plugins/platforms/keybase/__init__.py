@@ -1313,32 +1313,39 @@ def _on_keybase_session_reset(**kwargs: Any) -> None:
 
 
 def register(ctx) -> None:
-    """Plugin entry point — wire the session-reset hook into the gateway."""
+    """Plugin entry point — register the platform adapter and wire the
+    session-reset hook into the gateway.
+
+    Registration lives INSIDE register(ctx) (not at module import) so the
+    bundled-platform discovery path — which imports the module only as a
+    side effect of calling register(ctx) — always produces the PlatformEntry.
+    Registering at module level left the deferred loader's discovery check
+    reporting ``Plugin 'keybase' has no register() function`` and, more
+    importantly, made the adapter's presence depend on import-ordering side
+    effects that the plugin manager does not guarantee. This matches the
+    pattern every other bundled platform plugin uses.
+    """
+    try:
+        ctx.register_platform(
+            name="keybase",
+            label="Keybase",
+            adapter_factory=KeybaseAdapter,
+            check_fn=check_keybase_requirements,
+            # Credentials are a logged-in `keybase` CLI session, not env vars.
+            # check_fn() (binary on PATH) is enough to consider this "connected"
+            # at config time; login state is verified at connect() time.
+            is_connected=lambda cfg: check_keybase_requirements(),
+            required_env=[],
+            # Auth env vars for _is_user_authorized() integration (Keybase usernames)
+            allowed_users_env="KEYBASE_ALLOWED_USERS",
+            allow_all_env="KEYBASE_ALLOW_ALL_USERS",
+            emoji="🔑",
+            platform_hint="You are chatting via Keybase. Keep replies concise; markdown is not rendered.",
+        )
+    except Exception as exc:
+        logger.warning("Keybase: failed to register platform adapter: %s", exc)
+
     try:
         ctx.register_hook("on_session_reset", _on_keybase_session_reset)
     except Exception as exc:
         logger.warning("Keybase: failed to register on_session_reset hook: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Plugin registration
-# ---------------------------------------------------------------------------
-
-from gateway.platform_registry import platform_registry, PlatformEntry  # noqa: E402
-
-platform_registry.register(PlatformEntry(
-    name="keybase",
-    label="Keybase",
-    adapter_factory=KeybaseAdapter,
-    check_fn=check_keybase_requirements,
-    # Credentials are a logged-in `keybase` CLI session, not env vars.
-    # check_fn() (binary on PATH) is enough to consider this "connected"
-    # at config time; login state is verified at connect() time.
-    is_connected=lambda cfg: check_keybase_requirements(),
-    required_env=[],
-    # Auth env vars for _is_user_authorized() integration (Keybase usernames)
-    allowed_users_env="KEYBASE_ALLOWED_USERS",
-    allow_all_env="KEYBASE_ALLOW_ALL_USERS",
-    emoji="🔑",
-    platform_hint="You are chatting via Keybase. Keep replies concise; markdown is not rendered.",
-))
