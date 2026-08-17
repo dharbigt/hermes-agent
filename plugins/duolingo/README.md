@@ -1,9 +1,9 @@
 # Duolingo Plugin
 
 This optional, read-only plugin imports Duolingo profile and vocabulary data to
-support targeted vocabulary practice. It uses the unofficial API documented at
-https://github.com/igorskh/duolingo-api, so endpoint and response-shape changes
-are possible.
+support targeted vocabulary practice. It uses unofficial endpoints (Practice Hub
+`learned-lexemes` plus `/2017-06-30/users`), so endpoint and response-shape
+changes are possible.
 
 ## Setup
 
@@ -27,9 +27,13 @@ agent will use it.
 ## Tools
 
 - `duolingo_profile(username)` returns a deliberately minimized progress
-  summary: courses, XP, streak, and words learned.
-- `duolingo_review_queue(user_id, limit)` returns vocabulary ranked by numeric
-  strength when that field is supplied by the API.
+  summary: course language, XP, streak, and words learned
+  (`pagination.totalLexemes` from Practice Hub). Chess/math/music current
+  courses fall back to the highest-XP language course.
+- `duolingo_review_queue(user_id, limit, learning_language?, from_language?)`
+  returns learned lexemes from
+  `POST /2017-06-30/users/{id}/courses/{learn}/{from}/learned-lexemes`.
+  Newest / `is_new` items come first. Per-word strength is no longer provided.
 - `duolingo_assess_conversation(transcript, target_vocabulary)` reports exact
   target-vocabulary use in learner turns. It is an auditable coverage signal,
   not a proficiency judgment.
