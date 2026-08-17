@@ -34,6 +34,12 @@ agent will use it.
   returns learned lexemes from
   `POST /2017-06-30/users/{id}/courses/{learn}/{from}/learned-lexemes`.
   Newest / `is_new` items come first. Per-word strength is no longer provided.
+- `duolingo_practice_brief(...)` turns a lexeme list (or a pulled queue) into a
+  generation brief: form, target words, constraints, writer instructions. It
+  does **not** write the text. Forms: `narrative`, `dialogue`, `captions`,
+  `drill`, `free`.
+- `duolingo_assess_text(text, target_vocabulary)` reports exact target-word
+  use in any practice text.
 - `duolingo_assess_conversation(transcript, target_vocabulary)` reports exact
   target-vocabulary use in learner turns. It is an auditable coverage signal,
   not a proficiency judgment.

@@ -26,9 +26,13 @@ def test_registers_only_the_duolingo_toolset():
     assert {call["name"] for call in calls} == {
         "duolingo_profile",
         "duolingo_review_queue",
+        "duolingo_practice_brief",
+        "duolingo_assess_text",
         "duolingo_assess_conversation",
     }
     assert {call["toolset"] for call in calls} == {"duolingo"}
+    gated = {call["name"] for call in calls if call.get("check_fn")}
+    assert gated == {"duolingo_profile", "duolingo_review_queue"}
 
 
 def test_client_sends_bearer_token_and_only_gets():
@@ -188,6 +192,40 @@ def test_review_queue_uses_learned_lexemes_and_prefers_new_words(monkeypatch):
     assert result["review_items"][0]["translation"] == "shush"
 
 
+def test_practice_brief_can_pull_the_review_queue(monkeypatch):
+    from plugins.duolingo import tools
+
+    class Client:
+        def get_user_by_id(self, _user_id, fields=None):
+            return {
+                "id": 1,
+                "currentCourseId": "DUOLINGO_FR_EN",
+                "fromLanguage": "en",
+                "courses": [{"id": "DUOLINGO_FR_EN", "learningLanguage": "fr", "fromLanguage": "en", "xp": 10}],
+            }
+
+        def get_course(self, _user_id, _course_id):
+            return {
+                "id": "DUOLINGO_FR_EN",
+                "learningLanguage": "fr",
+                "fromLanguage": "en",
+                "pathSectioned": [],
+            }
+
+        def get_learned_lexemes(self, *_args, **_kwargs):
+            return {
+                "learnedLexemes": [{"text": "chut", "translations": ["shush"], "isNew": True}],
+                "pagination": {"totalLexemes": 512},
+            }
+
+    monkeypatch.setattr(tools, "_client_or_error", lambda: Client())
+    result = json.loads(tools.handle_practice_brief({"user_id": 1, "form": "captions", "limit": 5}))
+    assert result["form"] == "captions"
+    assert result["available_items"] == 512
+    assert result["target_vocabulary"] == ["chut"]
+    assert result["generate"] is False
+
+
 def test_profile_uses_total_lexemes_not_zero_words_learned(monkeypatch):
     from plugins.duolingo import tools
 
@@ -239,3 +277,56 @@ def test_conversation_assessment_uses_learner_turns_only():
     assert result["used"] == ["casa"]
     assert result["not_demonstrated"] == ["perro"]
     assert result["coverage"] == 0.5
+
+
+def test_assess_text_scores_full_passage():
+    from plugins.duolingo.tools import handle_assess_text
+
+    result = json.loads(handle_assess_text({
+        "text": "Cái giường mới lớn. Cửa sổ trắng.",
+        "target_vocabulary": ["giường", "cửa sổ", "đắt"],
+    }))
+
+    assert result["used"] == ["giường", "cửa sổ"]
+    assert result["not_demonstrated"] == ["đắt"]
+    assert result["coverage"] == 0.667
+
+
+def test_practice_brief_from_items_does_not_write_text():
+    from plugins.duolingo.tools import handle_practice_brief
+
+    result = json.loads(handle_practice_brief({
+        "items": ["buồn", {"word": "giường", "translations": ["bed"], "is_new": True}, "buồn"],
+        "form": "narrative",
+        "learning_language": "vi",
+        "from_language": "en",
+        "extra_instructions": "moving-in day",
+        "exchanges": 10,
+    }))
+
+    assert result["generate"] is False
+    assert result["form"] == "narrative"
+    assert result["learning_language"] == "vi"
+    assert result["target_vocabulary"] == ["buồn", "giường"]
+    assert result["items"][1]["translation"] == "bed"
+    assert result["constraints"]["tell_a_story"] is True
+    assert result["constraints"]["beats"] == 10
+    assert result["writer_instructions"][-1] == "moving-in day"
+
+
+def test_practice_brief_requires_user_id_or_items():
+    from plugins.duolingo.tools import handle_practice_brief
+
+    result = json.loads(handle_practice_brief({"form": "dialogue"}))
+    assert result["error"] == "user_id or items is required"
+
+
+def test_practice_brief_rejects_unknown_form():
+    from plugins.duolingo.practice import practice_brief
+
+    try:
+        practice_brief([{"word": "nhà"}], form="sonnet")
+    except ValueError as exc:
+        assert "form must be one of" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")

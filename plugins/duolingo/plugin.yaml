@@ -1,9 +1,11 @@
 name: duolingo
-version: 0.2.0
+version: 0.3.0
 description: Read Duolingo progress and vocabulary for targeted language practice.
 author: dharbigt
 kind: standalone
 provides_tools:
   - duolingo_profile
   - duolingo_review_queue
+  - duolingo_practice_brief
+  - duolingo_assess_text
   - duolingo_assess_conversation

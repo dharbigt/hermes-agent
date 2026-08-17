@@ -11,6 +11,13 @@ from plugins.duolingo.client import (
     progressed_skills_from_course,
     select_language_course,
 )
+from plugins.duolingo.practice import (
+    FORMS,
+    entries_from_learned_lexemes,
+    normalize_items,
+    practice_brief,
+    score_lexemes,
+)
 from tools.registry import tool_error, tool_result
 
 DUOLINGO_PROFILE_SCHEMA = {
@@ -50,6 +57,58 @@ DUOLINGO_ASSESS_CONVERSATION_SCHEMA = {
             "target_vocabulary": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100, "description": "Words or phrases being assessed."},
         },
         "required": ["transcript", "target_vocabulary"],
+        "additionalProperties": False,
+    },
+}
+
+DUOLINGO_ASSESS_TEXT_SCHEMA = {
+    "name": "duolingo_assess_text",
+    "description": "Measure which target vocabulary occurs in any supplied text; usage evidence, not proficiency.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Practice text to score (story, captions, drill, dialogue)."},
+            "target_vocabulary": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 100,
+                "description": "Words or phrases being assessed.",
+            },
+        },
+        "required": ["text", "target_vocabulary"],
+        "additionalProperties": False,
+    },
+}
+
+DUOLINGO_PRACTICE_BRIEF_SCHEMA = {
+    "name": "duolingo_practice_brief",
+    "description": "Build a generation brief from a lexeme list or Practice Hub queue. Does not write the text.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "integer", "minimum": 1, "description": "Duolingo numeric user ID. Pulls the review queue when items are omitted."},
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 100,
+                "description": "Explicit lexemes (strings or {word, translations, is_new} objects). Skips the API when set.",
+                "items": {
+                    "type": ["string", "object"],
+                    "additionalProperties": True,
+                },
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Queue size when pulling; default 20."},
+            "learning_language": {"type": "string", "description": "Course language code (e.g. vi). Defaults to the current language course when pulling."},
+            "from_language": {"type": "string", "description": "UI/from language code (e.g. en)."},
+            "form": {
+                "type": "string",
+                "enum": list(FORMS),
+                "description": "narrative, dialogue, captions, drill, or free. Default free.",
+            },
+            "extra_instructions": {"type": "string", "description": "Optional story hint, tone, or length note for the writer."},
+            "exchanges": {"type": "integer", "minimum": 1, "maximum": 40, "description": "Dialogue exchanges, or beats for a narrative."},
+        },
         "additionalProperties": False,
     },
 }
@@ -148,30 +207,42 @@ def handle_profile(args: dict, **_kwargs: Any) -> str:
     })
 
 
-def _word_entry(item: dict[str, Any]) -> dict[str, Any] | None:
-    word = next((item.get(key) for key in ("text", "word_string", "word", "lexeme_string") if item.get(key)), None)
-    if not isinstance(word, str):
-        return None
-    entry: dict[str, Any] = {"word": word}
-    translations = item.get("translations")
-    if isinstance(translations, list):
-        texts = [text for text in translations if isinstance(text, str) and text]
-        if texts:
-            entry["translations"] = texts
-            entry["translation"] = texts[0]
-    if isinstance(item.get("isNew"), bool):
-        entry["is_new"] = item["isNew"]
-    for key in ("translation", "meaning", "strength", "skill_strength", "learning_progress", "last_practiced"):
-        if key in entry:
-            continue
-        value = item.get(key)
-        if isinstance(value, (str, int, float, bool)):
-            entry[key] = value
-    return entry
-
-
-def _review_rank(entry: dict[str, Any]) -> tuple[int, str]:
-    return (0 if entry.get("is_new") else 1, entry["word"].casefold())
+def _review_queue_data(client: DuolingoClient, args: dict) -> dict[str, Any]:
+    user_id = int(args.get("user_id") or 0)
+    limit = min(100, max(1, int(args.get("limit") or 20)))
+    user = client.get_user_by_id(user_id, fields="id,currentCourseId,fromLanguage,courses")
+    if not isinstance(user, dict):
+        raise DuolingoAPIError("Duolingo returned no user profile.")
+    course = _load_language_course(
+        client,
+        user,
+        user_id,
+        learning_language=str(args.get("learning_language") or "").strip() or None,
+        from_language=str(args.get("from_language") or "").strip() or None,
+    )
+    learning_language = str(course.get("learningLanguage") or "")
+    from_language = str(course.get("fromLanguage") or user.get("fromLanguage") or "en")
+    payload = client.get_learned_lexemes(
+        user_id,
+        learning_language,
+        from_language,
+        progressed_skills_from_course(course),
+        limit=limit,
+    )
+    entries = entries_from_learned_lexemes(payload)
+    raw_pagination = payload.get("pagination")
+    pagination: dict[str, Any] = raw_pagination if isinstance(raw_pagination, dict) else {}
+    available = pagination.get("totalLexemes")
+    return {
+        "learning_language": learning_language,
+        "from_language": from_language,
+        "available_items": available if isinstance(available, int) else len(entries),
+        "review_items": entries[:limit],
+        "ranking_note": (
+            "Newest learned lexemes from Practice Hub; is_new items are listed first. "
+            "Duolingo no longer returns per-word strength."
+        ),
+    }
 
 
 def handle_review_queue(args: dict, **_kwargs: Any) -> str:
@@ -179,41 +250,9 @@ def handle_review_queue(args: dict, **_kwargs: Any) -> str:
     if isinstance(client, str):
         return client
     try:
-        user_id = int(args.get("user_id") or 0)
-        limit = min(100, max(1, int(args.get("limit") or 20)))
-        user = client.get_user_by_id(user_id, fields="id,currentCourseId,fromLanguage,courses")
-        course = _load_language_course(
-            client,
-            user,
-            user_id,
-            learning_language=str(args.get("learning_language") or "").strip() or None,
-            from_language=str(args.get("from_language") or "").strip() or None,
-        )
-        learning_language = str(course.get("learningLanguage") or "")
-        from_language = str(course.get("fromLanguage") or user.get("fromLanguage") or "en")
-        payload = client.get_learned_lexemes(
-            user_id,
-            learning_language,
-            from_language,
-            progressed_skills_from_course(course),
-            limit=limit,
-        )
+        return tool_result(_review_queue_data(client, args))
     except (TypeError, ValueError, DuolingoAPIError) as exc:
         return tool_error(str(exc))
-
-    items = payload.get("learnedLexemes")
-    entries = [entry for item in items if isinstance(item, dict) and (entry := _word_entry(item))] if isinstance(items, list) else []
-    entries.sort(key=_review_rank)
-    raw_pagination = payload.get("pagination")
-    pagination: dict[str, Any] = raw_pagination if isinstance(raw_pagination, dict) else {}
-    available = pagination.get("totalLexemes")
-    return tool_result({
-        "learning_language": learning_language,
-        "from_language": from_language,
-        "available_items": available if isinstance(available, int) else len(entries),
-        "review_items": entries[:limit],
-        "ranking_note": "Newest learned lexemes from Practice Hub; is_new items are listed first. Duolingo no longer returns per-word strength.",
-    })
 
 
 def _learner_text(transcript: str) -> str:
@@ -221,24 +260,74 @@ def _learner_text(transcript: str) -> str:
     return "\n".join(turns) if turns else transcript
 
 
-def handle_assess_conversation(args: dict, **_kwargs: Any) -> str:
-    transcript = str(args.get("transcript") or "").strip()
-    raw_targets = args.get("target_vocabulary")
-    if not transcript:
-        return tool_error("transcript is required")
+def _targets(raw_targets: Any) -> list[str]:
     if not isinstance(raw_targets, list):
-        return tool_error("target_vocabulary must be a list of words or phrases")
+        raise ValueError("target_vocabulary must be a list of words or phrases")
     targets = list(dict.fromkeys(str(item).strip() for item in raw_targets if str(item).strip()))
     if not targets:
-        return tool_error("target_vocabulary must contain at least one word or phrase")
+        raise ValueError("target_vocabulary must contain at least one word or phrase")
+    return targets
 
-    learner_text = _learner_text(transcript)
-    used = [word for word in targets if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", learner_text, re.IGNORECASE)]
-    missing = [word for word in targets if word not in used]
-    return tool_result({
-        "target_count": len(targets),
-        "used": used,
-        "not_demonstrated": missing,
-        "coverage": round(len(used) / len(targets), 3),
-        "evidence_scope": "Exact vocabulary occurrence in learner-labelled turns when present; this is not a proficiency score.",
-    })
+
+def handle_assess_conversation(args: dict, **_kwargs: Any) -> str:
+    transcript = str(args.get("transcript") or "").strip()
+    if not transcript:
+        return tool_error("transcript is required")
+    try:
+        targets = _targets(args.get("target_vocabulary"))
+    except ValueError as exc:
+        return tool_error(str(exc))
+    result = score_lexemes(_learner_text(transcript), targets)
+    result["evidence_scope"] = (
+        "Exact vocabulary occurrence in learner-labelled turns when present; this is not a proficiency score."
+    )
+    return tool_result(result)
+
+
+def handle_assess_text(args: dict, **_kwargs: Any) -> str:
+    text = str(args.get("text") or "").strip()
+    if not text:
+        return tool_error("text is required")
+    try:
+        targets = _targets(args.get("target_vocabulary"))
+    except ValueError as exc:
+        return tool_error(str(exc))
+    result = score_lexemes(text, targets)
+    result["evidence_scope"] = "Exact vocabulary occurrence in the supplied text; this is not a proficiency score."
+    return tool_result(result)
+
+
+def handle_practice_brief(args: dict, **_kwargs: Any) -> str:
+    raw_items = args.get("items")
+    try:
+        if raw_items is not None:
+            entries = normalize_items(raw_items)
+            learning_language = str(args.get("learning_language") or "").strip()
+            from_language = str(args.get("from_language") or "").strip()
+            available = len(entries)
+        else:
+            if not args.get("user_id"):
+                return tool_error("user_id or items is required")
+            client = _client_or_error()
+            if isinstance(client, str):
+                return client
+            queue = _review_queue_data(client, args)
+            entries = list(queue["review_items"])
+            learning_language = str(args.get("learning_language") or queue.get("learning_language") or "").strip()
+            from_language = str(args.get("from_language") or queue.get("from_language") or "").strip()
+            available = queue.get("available_items")
+            if not isinstance(available, int):
+                available = len(entries)
+        exchanges = args.get("exchanges")
+        brief = practice_brief(
+            entries,
+            form=str(args.get("form") or "free"),
+            learning_language=learning_language,
+            from_language=from_language,
+            extra_instructions=str(args.get("extra_instructions") or ""),
+            exchanges=int(exchanges) if exchanges is not None else None,
+            available_items=available,
+        )
+    except (TypeError, ValueError, DuolingoAPIError) as exc:
+        return tool_error(str(exc))
+    return tool_result(brief)
