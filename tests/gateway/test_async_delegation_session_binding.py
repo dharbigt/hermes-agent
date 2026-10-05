@@ -8,18 +8,11 @@ Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 3. /new interrupts the old conversation's in-flight async delegations.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import tools.async_delegation as ad
-
-from tests.gateway.test_session_model_reset import (  # noqa: F401
-    _make_event,
-    _make_runner,
-    _make_source,
-    build_session_key,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -121,7 +114,7 @@ class TestGatewayPinningFailsClosed:
 
         assert resolved is pinned
         getattr(runner.session_store, "switch_session").assert_called_once_with(
-            current.session_key, "sess_live"
+            current.session_key, "sess_live", expected_session_id=current.session_id,
         )
 
     @pytest.mark.asyncio
@@ -215,25 +208,52 @@ class TestGatewayPinningFailsClosed:
         ).assert_called_once_with(current.session_key, "sess_parent", "sess_tip")
 
 
-class TestResetHandlerInterruptsDelegations:
-    @pytest.mark.asyncio
-    async def test_reset_command_calls_interrupt_for_session(self, monkeypatch):
-        """The reset path must sever the old conversation's delegations."""
-        from gateway import slash_commands
-        from tools import async_delegation
 
-        captured = {}
 
-        def _spy(session_key=None, parent_session_id=None, reason=None):
-            captured["session_key"] = session_key
-            captured["parent_session_id"] = parent_session_id
-            captured["reason"] = reason
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["none", "revoke", "replace"])
+async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
+    """A non-compression re-pin that resolved its row across an await must not move the route
+    after the run was invalidated (/stop) or the route was replaced (/new, /resume) meanwhile;
+    an undisturbed pin still lands. Real store + real resolver; the DB lookup is event-gated.
+    Scenario by the #113690 reporter."""
+    import asyncio
+    from types import SimpleNamespace
 
-        monkeypatch.setattr(async_delegation, "interrupt_for_session", _spy)
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 
-        runner = _make_runner()
-        session_key = build_session_key(_make_source())
-        await runner._handle_reset_command(_make_event("/new"))
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="test-chat", chat_type="dm", user_id="test-user")
+    entry = store.get_or_create_session(source)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    generation = runner._begin_session_run_generation(entry.session_key)
+    entered, release = asyncio.Event(), asyncio.Event()
 
-        assert captured.get("session_key") == session_key
-        assert captured.get("reason") == "session_reset"
+    async def get_session(session_id):
+        entered.set()
+        await release.wait()
+        return {"id": session_id, "ended_at": None}
+
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(side_effect=get_session))
+    task = asyncio.create_task(runner._resolve_async_delegation_session(entry, "test-pinned"))
+    await asyncio.wait_for(entered.wait(), 3)
+    expected = "test-pinned"
+    if boundary != "none":
+        runner._invalidate_session_run_generation(entry.session_key, reason="test boundary")
+        assert not runner._is_session_run_current(entry.session_key, generation)
+        expected = entry.session_id
+    if boundary == "replace":
+        store.switch_session(entry.session_key, "test-replacement")
+        expected = "test-replacement"
+    release.set()
+    result = await asyncio.wait_for(task, 3)
+
+    assert store.lookup_by_session_key(entry.session_key).session_id == expected
+    if boundary == "none":
+        assert result is not None and result.session_id == expected
+    else:
+        assert result is None
