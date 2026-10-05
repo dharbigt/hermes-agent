@@ -10,6 +10,16 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Agent-facing Git operations are opt-in per profile. Reads and mutations
+    # are both constrained to workspace_root; mutations have separate gates.
+    "git": {
+        "enabled": False,
+        "workspace_root": "",
+        "allowed_repositories": [],
+        "allow_commit": False,
+        "allow_push": False,
+        "allow_pr": False,
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).

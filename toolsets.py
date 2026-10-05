@@ -193,6 +193,12 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "git": {
+        "description": "Profile-approved Git status, diff, and commit tools",
+        "tools": ["git_status", "git_diff", "git_commit", "git_push", "git_create_pr"],
+        "includes": []
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",

@@ -120,3 +120,31 @@ Keybase provides end-to-end encryption and public-key identity verification —
 real strengths. A secure transport does **not** by itself make agent tool
 access safe: keep Hermes allowlists / DM pairing enabled for the Keybase
 platform as for any other channel.
+
+## Optional Git workflow
+
+The shared agent Git toolset can be enabled for a Keybase profile without
+putting Git logic in this adapter. Add this to that profile's `config.yaml`
+(or use the profile-aware configuration command):
+
+```yaml
+git:
+  enabled: true
+  workspace_root: /srv/hermes/repos
+  allowed_repositories:
+    - /srv/hermes/repos/project
+  allow_commit: false
+  allow_push: false
+  allow_pr: false
+platform_toolsets:
+  keybase:
+    - hermes-keybase
+    - git
+```
+
+The Git tools are `git_status`, `git_diff`, `git_commit`, `git_push`, and
+`git_create_pr`. They resolve the active multiplexed profile, reject paths
+outside `workspace_root`/`allowed_repositories`, run non-interactively, and
+keep commit, push, and pull-request creation disabled unless their individual
+flags are enabled. Keep those mutation flags off until the workflow has been
+tested against a disposable repository.
