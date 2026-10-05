@@ -296,7 +296,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
-            if now - ts < _check_fn_ttl_seconds:
+            if now - ts < _CHECK_FN_TTL_SECONDS:
                 return value
 
     raised = False
